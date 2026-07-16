@@ -1,0 +1,12 @@
+config.json
+counter_config.json
+sessions/
+files/
+logs/
+reports/
+multichannel_gateway/data/
+НИК*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
