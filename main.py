@@ -119,6 +119,7 @@ class ConsoleMenu:
         print("5. 🚀 ЗАПУСТИТЬ БОТА")
         print("6. 🌐 Настроить VK / MAX токены")
         print("7. ❌ Выйти")
+        print("8. 💬 Настроить Telegram-беседы")
         print("")
         print("Версия: 1.8")
         print("-" * 60)
@@ -845,8 +846,7 @@ class FileDistributionBot:
                                     message.reply_to_message_id = matched_info["reply_to_message_id"]
                                     await self.handlers.handle_editor_response(client, message)
 
-                # 3. Обработчик ответов от AI ботов (НИК-3..НИК-7)
-                normal_accounts = settings.get("normal_accounts", ["НИК-3", "НИК-4", "НИК-5", "НИК-6", "НИК-7"])
+                normal_accounts = settings.get("normal_accounts") or []
                 if nickname in normal_accounts:
                     ai_bot = settings.get("ai_bot", "@AAA_Report_AIBot")
                     @client.on_message(filters.chat(ai_bot))
@@ -992,13 +992,23 @@ class FileDistributionBot:
                 job,
                 is_anti=self.handlers.processor.is_anti_file(job.original_file_name),
             )
-            if self.handlers.is_force_plagiscan_file_info(file_info):
-                file_info["is_anti"] = True
-                file_info["force_plagiscan"] = True
-                append_channel_log(
-                    "plagiscan",
-                    f"🛡️ force_plagiscan external source={job.source} sender={job.sender_id} file={job.original_file_name}",
-                )
+            forced_route = self.handlers.get_force_author_route(file_info)
+            if forced_route:
+                file_info["forced_route"] = forced_route
+                if forced_route["destination"] == "plagiscan":
+                    file_info["is_anti"] = True
+                    file_info["force_plagiscan"] = True
+                    append_channel_log(
+                        "plagiscan",
+                        f"🛡️ force_plagiscan external source={job.source} sender={job.sender_id} file={job.original_file_name}",
+                    )
+                else:
+                    file_info["fixed_author_editor_route"] = True
+                    file_info["forced_editor_nickname"] = forced_route["editor_nickname"]
+                    append_channel_log(
+                        "editor",
+                        f"👤 fixed editor route external source={job.source} sender={job.sender_id} file={job.original_file_name}",
+                    )
             if self.handlers.processor.is_payment_document(job.original_file_name):
                 print(f"💰 External payment document skipped: source={job.source} job_id={job.job_id} file={job.original_file_name}")
                 append_channel_log("gateway", f"💰 External payment document skipped: source={job.source} job_id={job.job_id} file={job.original_file_name}")
@@ -1150,7 +1160,7 @@ async def main():
         menu.show_main_menu()
 
         try:
-            choice = input("\nВыберите действие (1-7): ").strip()
+            choice = input("\nВыберите действие (1-8): ").strip()
 
             if choice == '1':
                 # Настройка аккаунтов
@@ -1304,6 +1314,12 @@ async def main():
                 Config.save_config()
                 print("\n✅ Настройки VK/MAX/Long Poll сохранены в config.json")
                 input("\nНажмите Enter для продолжения...")
+
+            elif choice == '8':
+                Config.load_config()
+                await Config.setup_telegram_group_routes_interactive(
+                    bot.manager.get_client("НИК-1")
+                )
 
             elif choice == '7':
                 # Выход

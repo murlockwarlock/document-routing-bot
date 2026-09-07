@@ -55,6 +55,8 @@ def _load_counter_config() -> None:
 
     accounts_data = main_data.get("accounts", Config.DEFAULT_ACCOUNTS)
     for nickname, account_info in accounts_data.items():
+        if nickname not in Config.DEFAULT_ACCOUNTS:
+            continue
         account_info = dict(account_info or {})
         if account_info.get("api_id"):
             try:
@@ -79,6 +81,10 @@ def _load_counter_config() -> None:
     settings.update(counter_settings)
     settings["mode"] = "mode3"
     Config._SETTINGS = settings
+    Config._normalize_settings(
+        has_forced_authors_destination="forced_authors_destination" in main_settings,
+        legacy_author_routes=main_settings.get("plagiscan_user_routes"),
+    )
 
     print(f"✅ Конфигурация загружена: {len(Config._ACCOUNTS)} аккаунтов")
 

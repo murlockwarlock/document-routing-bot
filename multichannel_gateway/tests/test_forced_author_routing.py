@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 for module_name in (
     "pyrogram",
@@ -64,7 +64,10 @@ def base_settings(users, routes=None, **overrides):
         "editor_nickname": "@legacy-editor",
         "editor_24_7": "@editor-247",
         "plagiscan_users": users,
-        "plagiscan_user_routes": routes or {},
+        "plagiscan_user_routes": {},
+        "forced_authors_destination": "plagiscan",
+        "forced_authors_editor_nickname": None,
+        "telegram_group_routes": {},
     }
     settings.update(overrides)
     return settings
@@ -94,6 +97,581 @@ def telegram_file_info(author, author_id, file_name, *, chat_id=None, message_id
 
 
 class TestForcedAuthorRouting(unittest.TestCase):
+    def test_active_defaults_contain_only_first_two_accounts(self):
+        self.assertEqual(["НИК-1", "НИК-2"], list(Config.DEFAULT_ACCOUNTS))
+
+    def test_legacy_accounts_are_loaded_but_not_kept_active_or_saved(self):
+        old_accounts = Config._ACCOUNTS
+        old_settings = Config._SETTINGS
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.json"
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "accounts": {
+                                nickname: {"api_id": None, "api_hash": None, "phone": None}
+                                for nickname in (
+                                    "НИК-1",
+                                    "НИК-2",
+                                    "НИК-3",
+                                    "НИК-4",
+                                    "НИК-5",
+                                    "НИК-6",
+                                    "НИК-7",
+                                )
+                            },
+                            "settings": {"plagiscan_users": ["@legacy"]},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                with patch.object(Config, "CONFIG_FILE", config_path):
+                    Config.load_config()
+                    self.assertEqual({"НИК-1", "НИК-2"}, set(Config.get_all_accounts()))
+                    Config.save_config()
+                    saved = json.loads(config_path.read_text(encoding="utf-8"))
+                    self.assertEqual({"НИК-1", "НИК-2"}, set(saved["accounts"]))
+        finally:
+            Config._ACCOUNTS = old_accounts
+            Config._SETTINGS = old_settings
+
+    def test_account_menu_prompts_only_for_the_two_active_accounts(self):
+        old_accounts = Config._ACCOUNTS
+        old_settings = Config._SETTINGS
+        try:
+            Config._ACCOUNTS = {
+                "НИК-1": {"api_id": 1, "api_hash": "hash1", "phone": "+1001"},
+                "НИК-2": {"api_id": 2, "api_hash": "hash2", "phone": "+1002"},
+                "legacy-account": {"api_id": 3, "api_hash": "hash3", "phone": "+1003"},
+            }
+            Config._SETTINGS = {}
+            with patch.object(Config, "load_config"), patch.object(Config, "save_config"), patch(
+                "builtins.input", side_effect=["n", "n"]
+            ) as input_mock, patch("builtins.print") as print_mock:
+                Config.setup_accounts_interactive()
+
+            output = " ".join(str(item) for item in print_mock.call_args_list)
+            self.assertIn("НИК-1", output)
+            self.assertIn("НИК-2", output)
+            self.assertNotIn("legacy-account", output)
+            self.assertEqual(2, input_mock.call_count)
+        finally:
+            Config._ACCOUNTS = old_accounts
+            Config._SETTINGS = old_settings
+
+    def test_current_settings_show_only_active_accounts_and_human_forced_route(self):
+        old_accounts = Config._ACCOUNTS
+        old_settings = Config._SETTINGS
+        try:
+            Config._ACCOUNTS = {
+                "НИК-1": {"api_id": None, "api_hash": None, "phone": None},
+                "НИК-2": {"api_id": None, "api_hash": None, "phone": None},
+                "legacy-account": {"api_id": 3, "api_hash": "hash3", "phone": "+1003"},
+            }
+            Config._SETTINGS = {
+                "plagiscan_users": ["@ivan"],
+                "forced_authors_destination": "editor",
+                "forced_authors_editor_nickname": "@editor",
+                "telegram_group_routes": {
+                    "-100123": {"title": "Компания", "destination": "plagiscan"}
+                },
+            }
+            with patch.object(Config, "load_config"), patch("builtins.print") as print_mock:
+                Config.show_current_settings()
+
+            output = " ".join(str(item) for item in print_mock.call_args_list)
+            self.assertIn("Принудительные авторы", output)
+            self.assertIn("редактор @editor", output)
+            self.assertIn("Компания → Plagiscan", output)
+            self.assertNotIn("legacy-account", output)
+            for stale_name in ("НИК-3", "НИК-4", "НИК-5", "НИК-6", "НИК-7"):
+                self.assertNotIn(stale_name, output)
+        finally:
+            Config._ACCOUNTS = old_accounts
+            Config._SETTINGS = old_settings
+
+    def test_shared_forced_route_is_used_for_every_forced_author(self):
+        handlers = make_handlers()
+        settings = base_settings(
+            ["@ivan", "@masha", "vk:700"],
+            forced_authors_destination="editor",
+            forced_authors_editor_nickname="editor.one",
+        )
+
+        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)):
+            for file_info in (
+                {"author": "ivan", "author_id": 1},
+                {"author": "masha", "author_id": 2},
+                {"author": "VK Chat", "route_sender_id": "700", "route_sender_name": "vk-name"},
+            ):
+                self.assertEqual(
+                    {"destination": "editor", "editor_nickname": "@editor.one"},
+                    handlers.get_force_author_route(file_info),
+                )
+
+    def test_telegram_group_route_has_priority_over_shared_author_route(self):
+        handlers = make_handlers()
+        settings = base_settings(
+            ["author"],
+            forced_authors_destination="editor",
+            forced_authors_editor_nickname="@author-editor",
+            telegram_group_routes={
+                "-100123": {
+                    "title": "Компания",
+                    "destination": "editor",
+                    "editor_nickname": "@group-editor",
+                }
+            },
+        )
+
+        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)):
+            self.assertEqual(
+                {"destination": "editor", "editor_nickname": "@group-editor", "scope": "telegram_group"},
+                handlers.get_force_author_route(
+                    {
+                        "author": "ordinary",
+                        "author_id": 99,
+                        "source_platform": "telegram",
+                        "route_chat_id": -100123,
+                        "route_is_group": True,
+                    }
+                ),
+            )
+            self.assertEqual(
+                {"destination": "editor", "editor_nickname": "@author-editor"},
+                handlers.get_force_author_route({"author": "author", "author_id": 42}),
+            )
+
+    def test_explicit_shared_plagiscan_route_applies_to_every_forced_author(self):
+        handlers = make_handlers()
+        settings = base_settings(
+            ["@ivan", "@masha", "vk:700"],
+            forced_authors_destination="plagiscan",
+            forced_authors_editor_nickname=None,
+        )
+
+        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)):
+            self.assertEqual(
+                {"destination": "plagiscan"},
+                handlers.get_force_author_route({"author": "ivan", "author_id": 1}),
+            )
+            self.assertTrue(
+                handlers.is_force_plagiscan_file_info(
+                    {"author": "VK", "route_sender_id": "700", "source_platform": "vk"}
+                )
+            )
+
+    def test_legacy_conflicting_per_author_routes_migrate_to_safe_shared_plagiscan(self):
+        old_accounts = Config._ACCOUNTS
+        old_settings = Config._SETTINGS
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.json"
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "accounts": {},
+                            "settings": {
+                                "plagiscan_users": ["@ivan", "@masha"],
+                                "plagiscan_user_routes": {
+                                    "@ivan": {"destination": "editor", "editor_nickname": "@one"},
+                                    "@masha": {"destination": "editor", "editor_nickname": "@two"},
+                                },
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                with patch.object(Config, "CONFIG_FILE", config_path):
+                    Config.load_config()
+
+            self.assertEqual("plagiscan", Config.get_setting("forced_authors_destination"))
+            self.assertIsNone(Config.get_setting("forced_authors_editor_nickname"))
+            self.assertEqual({}, Config.get_setting("plagiscan_user_routes"))
+        finally:
+            Config._ACCOUNTS = old_accounts
+            Config._SETTINGS = old_settings
+
+    def test_legacy_same_editor_routes_migrate_to_one_shared_editor(self):
+        old_accounts = Config._ACCOUNTS
+        old_settings = Config._SETTINGS
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.json"
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "accounts": {},
+                            "settings": {
+                                "plagiscan_users": ["@ivan", "@masha"],
+                                "plagiscan_user_routes": {
+                                    "@ivan": {"destination": "editor", "editor_nickname": "@one"},
+                                    "@masha": {"destination": "editor", "editor_nickname": "one"},
+                                },
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                with patch.object(Config, "CONFIG_FILE", config_path):
+                    Config.load_config()
+
+            self.assertEqual("editor", Config.get_setting("forced_authors_destination"))
+            self.assertEqual("@one", Config.get_setting("forced_authors_editor_nickname"))
+            self.assertEqual({}, Config.get_setting("plagiscan_user_routes"))
+        finally:
+            Config._ACCOUNTS = old_accounts
+            Config._SETTINGS = old_settings
+
+    def test_legacy_partial_routes_migrate_to_safe_shared_plagiscan(self):
+        old_accounts = Config._ACCOUNTS
+        old_settings = Config._SETTINGS
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.json"
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "accounts": {},
+                            "settings": {
+                                "plagiscan_users": ["@ivan", "@masha"],
+                                "plagiscan_user_routes": {
+                                    "@ivan": {"destination": "editor", "editor_nickname": "@one"},
+                                },
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                with patch.object(Config, "CONFIG_FILE", config_path):
+                    Config.load_config()
+
+            self.assertEqual("plagiscan", Config.get_setting("forced_authors_destination"))
+            self.assertIsNone(Config.get_setting("forced_authors_editor_nickname"))
+        finally:
+            Config._ACCOUNTS = old_accounts
+            Config._SETTINGS = old_settings
+
+    def test_vk_external_job_uses_shared_editor_route_through_legacy_import_path(self):
+        from main import FileDistributionBot
+
+        manager = make_manager()
+        editor = MagicMock()
+        editor.send_document = AsyncMock(
+            return_value=SimpleNamespace(id=901, chat=SimpleNamespace(id=300))
+        )
+        manager.get_client.side_effect = lambda name: editor if name == "НИК-2" else None
+        handlers = make_handlers(manager)
+        handlers.process_anti_file = AsyncMock()
+        handlers.send_to_24_7_editor = AsyncMock()
+        handlers._mark_gateway_job_waiting_editor = AsyncMock()
+        bot = FileDistributionBot.__new__(FileDistributionBot)
+        bot.manager = manager
+        bot.handlers = handlers
+        bot.gateway_store = MagicMock()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_path = Path(temp_dir) / "work.docx"
+            source_path.write_bytes(b"source")
+            job = SimpleNamespace(
+                job_id=77,
+                source="vk",
+                dedupe_key="vk:700:800:0",
+                chat_id="2000000001",
+                sender_id="700",
+                sender_name="vk-author",
+                message_id="800",
+                original_file_name="work.docx",
+                file_path=str(source_path),
+            )
+            settings = base_settings(
+                ["vk:700"],
+                forced_authors_destination="editor",
+                forced_authors_editor_nickname="@shared-editor",
+            )
+            with patch("main.claim_external_job_for_legacy", new=AsyncMock(return_value=job)), patch(
+                "bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)
+            ):
+                asyncio.run(bot.import_external_jobs(limit=1))
+                self.assertEqual(1, len(manager.file_queue))
+                self.assertEqual(
+                    {"destination": "editor", "editor_nickname": "@shared-editor"},
+                    manager.file_queue[0]["forced_route"],
+                )
+                asyncio.run(handlers.process_queue())
+
+        self.assertEqual(1, editor.send_document.await_count)
+        self.assertEqual("@shared-editor", editor.send_document.await_args.kwargs["chat_id"])
+        self.assertEqual("work.docx", editor.send_document.await_args.kwargs["file_name"])
+        handlers.process_anti_file.assert_not_awaited()
+        handlers.send_to_24_7_editor.assert_not_awaited()
+
+    def test_configured_group_member_bypasses_author_allowlist_and_keeps_origin_context(self):
+        manager = make_manager()
+        handlers = make_handlers(manager)
+        handlers.process_queue = AsyncMock()
+        handlers.editor_tracking["existing-editor-task"] = {"destination": "@ordinary"}
+        message = SimpleNamespace(
+            id=777,
+            chat=SimpleNamespace(id=-100123, type="supergroup"),
+            from_user=SimpleNamespace(id=42, username="ordinary"),
+            document=SimpleNamespace(file_name="paper.docx"),
+            text=None,
+            reply_to_message_id=None,
+        )
+        ingest_job = SimpleNamespace(
+            job_id=77,
+            file_path="/tmp/paper.docx",
+            dedupe_key="telegram:-100123:777:0",
+        )
+        settings = base_settings(
+            [],
+            allowed_authors=["someone_else"],
+            telegram_group_routes={
+                "-100123": {
+                    "title": "Компания",
+                    "destination": "editor",
+                    "editor_nickname": "@group-editor",
+                }
+            },
+        )
+
+        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)), patch(
+            "bot_handlers.ingest_pyrogram_message", new=AsyncMock(return_value=[ingest_job])
+        ):
+            asyncio.run(handlers.handle_main_account(MagicMock(), message))
+
+        queued = manager.file_queue[0]
+        self.assertEqual("ordinary", queued["author"])
+        self.assertEqual(-100123, queued["route_chat_id"])
+        self.assertEqual(777, queued["route_message_id"])
+        self.assertTrue(queued["route_is_group"])
+        self.assertEqual(
+            {"destination": "editor", "editor_nickname": "@group-editor", "scope": "telegram_group"},
+            queued["forced_route"],
+        )
+        self.assertTrue(queued["fixed_author_editor_route"])
+        self.assertFalse(queued["force_plagiscan"])
+        self.assertEqual(1, handlers.files_today["count"])
+
+    def test_configured_group_plagiscan_route_ignores_anti_marker_but_keeps_filter_path(self):
+        manager = make_manager()
+        handlers = make_handlers(manager)
+        handlers.process_anti_file = AsyncMock()
+        task = telegram_file_info("ordinary", 42, "ordinary.docx", chat_id=-100123, message_id=777)
+        task["is_anti"] = False
+        task["force_plagiscan"] = False
+        manager.file_queue = [task]
+        settings = base_settings(
+            [],
+            telegram_group_routes={
+                "-100123": {"title": "Компания", "destination": "plagiscan"}
+            },
+        )
+
+        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)):
+            asyncio.run(handlers.process_queue())
+
+        handlers.process_anti_file.assert_awaited_once_with(task)
+        self.assertTrue(task["force_plagiscan"])
+        self.assertTrue(task["is_anti"])
+
+    def test_dialog_discovery_returns_only_unique_groups_and_supergroups(self):
+        async def dialog_stream():
+            for chat in (
+                SimpleNamespace(id=-1001, title="Группа", type="group"),
+                SimpleNamespace(id=-1002, title="Супергруппа", type="supergroup"),
+                SimpleNamespace(id=55, title="Личный чат", type="private"),
+                SimpleNamespace(id=-1003, title="Канал", type="channel"),
+                SimpleNamespace(id=-1001, title="Дубликат", type="group"),
+            ):
+                yield SimpleNamespace(chat=chat)
+
+        client = SimpleNamespace(get_dialogs=lambda: dialog_stream())
+        dialogs = asyncio.run(Config.get_telegram_group_dialogs(client))
+
+        self.assertEqual(
+            [
+                {"chat_id": "-1001", "title": "Группа", "chat_type": "group"},
+                {"chat_id": "-1002", "title": "Супергруппа", "chat_type": "supergroup"},
+            ],
+            dialogs,
+        )
+
+    def test_forced_author_menu_asks_for_one_shared_route_and_enter_preserves_it(self):
+        old_settings = Config._SETTINGS
+        try:
+            Config._SETTINGS = {
+                "plagiscan_users": ["vk:700", "@ivan", "@masha"],
+                "forced_authors_destination": "editor",
+                "forced_authors_editor_nickname": "@old-editor",
+            }
+            with patch("builtins.input", side_effect=["", "", ""]), patch.object(Config, "save_config"):
+                Config.setup_forced_authors_interactive()
+
+            self.assertEqual(["vk:700", "@ivan", "@masha"], Config.get_setting("plagiscan_users"))
+            self.assertEqual("editor", Config.get_setting("forced_authors_destination"))
+            self.assertEqual("@old-editor", Config.get_setting("forced_authors_editor_nickname"))
+        finally:
+            Config._SETTINGS = old_settings
+
+    def test_group_menu_adds_by_title_without_manual_chat_id(self):
+        old_settings = Config._SETTINGS
+        try:
+            Config._SETTINGS = {"telegram_group_routes": {}}
+            dialogs = [
+                {"chat_id": "-100123", "title": "Компания Бета", "chat_type": "group"},
+                {"chat_id": "-100124", "title": "Компания Альфа", "chat_type": "supergroup"},
+                {"chat_id": "55", "title": "Личный чат", "chat_type": "private"},
+            ]
+            with patch.object(Config, "get_telegram_group_dialogs", new=AsyncMock(return_value=dialogs)), patch.object(
+                Config, "save_config"
+            ) as save_config, patch(
+                "builtins.input", side_effect=["1", "2", "2", "group.editor", "4"]
+            ):
+                asyncio.run(Config.setup_telegram_group_routes_interactive())
+
+            self.assertEqual(
+                {
+                    "-100124": {
+                        "title": "Компания Альфа",
+                        "destination": "editor",
+                        "editor_nickname": "@group.editor",
+                    }
+                },
+                Config.get_setting("telegram_group_routes"),
+            )
+            save_config.assert_called_once()
+        finally:
+            Config._SETTINGS = old_settings
+
+    def test_group_menu_does_not_duplicate_an_existing_chat(self):
+        old_settings = Config._SETTINGS
+        try:
+            Config._SETTINGS = {
+                "telegram_group_routes": {
+                    "-100123": {
+                        "title": "Компания",
+                        "destination": "editor",
+                        "editor_nickname": "@old-editor",
+                    }
+                }
+            }
+            dialogs = [{"chat_id": "-100123", "title": "Компания", "chat_type": "group"}]
+            with patch.object(Config, "get_telegram_group_dialogs", new=AsyncMock(return_value=dialogs)), patch.object(
+                Config, "save_config"
+            ) as save_config, patch(
+                "builtins.input", side_effect=["1", "1", "2", "", "4"]
+            ):
+                asyncio.run(Config.setup_telegram_group_routes_interactive())
+
+            self.assertEqual(1, len(Config.get_setting("telegram_group_routes")))
+            self.assertEqual("@old-editor", Config.get_setting("telegram_group_routes")["-100123"]["editor_nickname"])
+            save_config.assert_called_once()
+        finally:
+            Config._SETTINGS = old_settings
+
+    def test_group_menu_searches_case_insensitively_after_ten_dialogs(self):
+        old_settings = Config._SETTINGS
+        try:
+            Config._SETTINGS = {"telegram_group_routes": {}}
+            dialogs = [
+                {"chat_id": str(index), "title": f"Команда {index}", "chat_type": "group"}
+                for index in range(11)
+            ] + [
+                {"chat_id": "99", "title": "Ромашка сотрудники", "chat_type": "supergroup"}
+            ]
+            with patch.object(Config, "get_telegram_group_dialogs", new=AsyncMock(return_value=dialogs)), patch.object(
+                Config, "save_config"
+            ), patch(
+                "builtins.input", side_effect=["1", "11", "РОМАШ", "1", "1", "4"]
+            ) as input_mock, patch("builtins.print") as print_mock:
+                asyncio.run(Config.setup_telegram_group_routes_interactive())
+
+            self.assertEqual("99", next(iter(Config.get_setting("telegram_group_routes"))))
+            prompt_text = " ".join(str(call_item) for call_item in print_mock.call_args_list)
+            self.assertIn("Ромашка сотрудники", prompt_text)
+            self.assertNotIn("Введите chat_id", prompt_text)
+            self.assertEqual(6, input_mock.call_count)
+        finally:
+            Config._SETTINGS = old_settings
+
+    def test_group_menu_enter_does_not_change_saved_route_or_delete_it(self):
+        old_settings = Config._SETTINGS
+        try:
+            saved_route = {
+                "-100123": {
+                    "title": "Компания Альфа",
+                    "destination": "editor",
+                    "editor_nickname": "@old-editor",
+                }
+            }
+            Config._SETTINGS = {"telegram_group_routes": saved_route}
+            with patch.object(
+                Config,
+                "get_telegram_group_dialogs",
+                new=AsyncMock(return_value=[{"chat_id": "-100123", "title": "Компания Альфа", "chat_type": "group"}]),
+            ), patch.object(Config, "save_config") as save_config, patch(
+                "builtins.input", side_effect=["2", "", "3", "", "4"]
+            ):
+                asyncio.run(Config.setup_telegram_group_routes_interactive())
+
+            self.assertEqual(saved_route, Config.get_setting("telegram_group_routes"))
+            save_config.assert_not_called()
+        finally:
+            Config._SETTINGS = old_settings
+
+    def test_group_menu_refreshes_title_without_changing_route(self):
+        old_settings = Config._SETTINGS
+        try:
+            Config._SETTINGS = {
+                "telegram_group_routes": {
+                    "-100123": {
+                        "title": "Старое название",
+                        "destination": "editor",
+                        "editor_nickname": "@group-editor",
+                    }
+                }
+            }
+            with patch.object(
+                Config,
+                "get_telegram_group_dialogs",
+                new=AsyncMock(return_value=[{"chat_id": "-100123", "title": "Новое название", "chat_type": "supergroup"}]),
+            ), patch.object(Config, "save_config") as save_config, patch(
+                "builtins.input", side_effect=["2", "1", "", "4"]
+            ):
+                asyncio.run(Config.setup_telegram_group_routes_interactive())
+
+            self.assertEqual("Новое название", Config.get_setting("telegram_group_routes")["-100123"]["title"])
+            self.assertEqual("editor", Config.get_setting("telegram_group_routes")["-100123"]["destination"])
+            self.assertEqual("@group-editor", Config.get_setting("telegram_group_routes")["-100123"]["editor_nickname"])
+            save_config.assert_called_once()
+        finally:
+            Config._SETTINGS = old_settings
+
+    def test_group_menu_delete_is_the_only_explicit_clear_action(self):
+        old_settings = Config._SETTINGS
+        try:
+            Config._SETTINGS = {
+                "telegram_group_routes": {
+                    "-100123": {"title": "Компания", "destination": "plagiscan"}
+                }
+            }
+            with patch.object(Config, "save_config") as save_config, patch(
+                "builtins.input", side_effect=["3", "1", "4"]
+            ):
+                asyncio.run(Config.setup_telegram_group_routes_interactive())
+
+            self.assertEqual({}, Config.get_setting("telegram_group_routes"))
+            save_config.assert_called_once()
+        finally:
+            Config._SETTINGS = old_settings
+
     def test_old_config_loads_and_round_trips_without_manual_new_section(self):
         old_accounts = Config._ACCOUNTS
         old_settings = Config._SETTINGS
@@ -116,6 +694,8 @@ class TestForcedAuthorRouting(unittest.TestCase):
                     Config.load_config()
                     self.assertEqual(["@legacy"], Config.get_setting("plagiscan_users"))
                     self.assertEqual({}, Config.get_setting("plagiscan_user_routes"))
+                    self.assertEqual("plagiscan", Config.get_setting("forced_authors_destination"))
+                    self.assertEqual({}, Config.get_setting("telegram_group_routes"))
                     Config.save_config()
                     saved = json.loads(config_path.read_text(encoding="utf-8"))
                     self.assertEqual({}, saved["settings"]["plagiscan_user_routes"])
@@ -123,29 +703,25 @@ class TestForcedAuthorRouting(unittest.TestCase):
             Config._ACCOUNTS = old_accounts
             Config._SETTINGS = old_settings
 
-    def test_console_route_menu_saves_plagiscan_and_editor_choices(self):
+    def test_console_route_menu_saves_one_shared_editor_choice(self):
         old_settings = Config._SETTINGS
         try:
-            Config._SETTINGS = {"plagiscan_user_routes": {}}
-            with patch("builtins.input", side_effect=["1", "2", "editor.one"]), patch.object(
+            Config._SETTINGS = {
+                "plagiscan_users": ["@one", "vk:2"],
+                "plagiscan_user_routes": {},
+                "forced_authors_destination": "plagiscan",
+                "forced_authors_editor_nickname": None,
+            }
+            with patch("builtins.input", side_effect=["2", "editor.one"]), patch.object(
                 Config, "update_setting", wraps=Config.update_setting
             ) as update_setting:
-                Config.setup_plagiscan_user_routes_interactive(["@one", "vk:2"])
+                Config.setup_forced_authors_route_interactive()
 
-            self.assertEqual(
-                {
-                    "@one": {"destination": "plagiscan"},
-                    "vk:2": {"destination": "editor", "editor_nickname": "@editor.one"},
-                },
-                Config.get_setting("plagiscan_user_routes"),
-            )
-            update_setting.assert_called_once_with(
-                "plagiscan_user_routes",
-                {
-                    "@one": {"destination": "plagiscan"},
-                    "vk:2": {"destination": "editor", "editor_nickname": "@editor.one"},
-                },
-            )
+            self.assertEqual("editor", Config.get_setting("forced_authors_destination"))
+            self.assertEqual("@editor.one", Config.get_setting("forced_authors_editor_nickname"))
+            self.assertEqual({}, Config.get_setting("plagiscan_user_routes"))
+            update_setting.assert_any_call("forced_authors_destination", "editor")
+            update_setting.assert_any_call("forced_authors_editor_nickname", "@editor.one")
         finally:
             Config._SETTINGS = old_settings
 
@@ -153,24 +729,22 @@ class TestForcedAuthorRouting(unittest.TestCase):
         handlers = make_handlers()
         settings = base_settings(
             ["@tg-author", "vk:700", "@plagiscan-only"],
-            {
-                "@tg-author": {"destination": "editor", "editor_nickname": "@editor-tg"},
-                "vk:700": {"destination": "editor", "editor_nickname": "@editor-vk"},
-            },
+            forced_authors_destination="editor",
+            forced_authors_editor_nickname="@shared-editor",
         )
         with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)):
             self.assertEqual(
-                {"destination": "editor", "editor_nickname": "@editor-tg"},
+                {"destination": "editor", "editor_nickname": "@shared-editor"},
                 handlers.get_force_author_route({"author": "tg-author", "author_id": 42}),
             )
             self.assertEqual(
-                {"destination": "editor", "editor_nickname": "@editor-vk"},
+                {"destination": "editor", "editor_nickname": "@shared-editor"},
                 handlers.get_force_author_route(
                     {"author": "VK Chat", "route_sender_id": "700", "route_sender_name": "vk-name"}
                 ),
             )
             self.assertEqual(
-                {"destination": "plagiscan"},
+                {"destination": "editor", "editor_nickname": "@shared-editor"},
                 handlers.get_force_author_route({"author": "plagiscan-only"}),
             )
             self.assertIsNone(handlers.get_force_author_route({"author": "ordinary"}))
@@ -179,7 +753,8 @@ class TestForcedAuthorRouting(unittest.TestCase):
         handlers = make_handlers()
         settings = base_settings(
             ["987654321"],
-            {"987654321": {"destination": "editor", "editor_nickname": "@editor"}},
+            forced_authors_destination="editor",
+            forced_authors_editor_nickname="@editor",
             allowed_authors=["someone_else"],
         )
         with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)):
@@ -201,7 +776,8 @@ class TestForcedAuthorRouting(unittest.TestCase):
         handlers.manager.file_queue = [telegram_file_info("forced", 42, "work.docx")]
         settings = base_settings(
             ["forced"],
-            {"forced": {"destination": "editor", "editor_nickname": "@fixed-editor"}},
+            forced_authors_destination="editor",
+            forced_authors_editor_nickname="@fixed-editor",
             mode="mode2",
         )
 
@@ -246,11 +822,8 @@ class TestForcedAuthorRouting(unittest.TestCase):
         ]
         settings = base_settings(
             ["tg-author", "vk:700", "plagiscan-only"],
-            {
-                "tg-author": {"destination": "editor", "editor_nickname": "@editor-tg"},
-                "vk:700": {"destination": "editor", "editor_nickname": "@editor-vk"},
-                "plagiscan-only": {"destination": "plagiscan"},
-            },
+            forced_authors_destination="editor",
+            forced_authors_editor_nickname="@shared-editor",
         )
 
         with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)):
@@ -258,12 +831,17 @@ class TestForcedAuthorRouting(unittest.TestCase):
             asyncio.run(handlers.process_queue())
 
         destinations = [call.kwargs["chat_id"] for call in editor.send_document.await_args_list]
-        self.assertEqual(["@editor-tg", "@editor-vk"], destinations)
+        self.assertEqual(["@shared-editor", "@shared-editor"], destinations)
 
         plagiscan_handlers = make_handlers()
         plagiscan_handlers.process_anti_file = AsyncMock()
         plagiscan_handlers.manager.file_queue = [telegram_file_info("plagiscan-only", 11, "legacy.docx")]
-        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)):
+        plagiscan_settings = base_settings(
+            ["plagiscan-only"],
+            forced_authors_destination="plagiscan",
+            forced_authors_editor_nickname=None,
+        )
+        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(plagiscan_settings)):
             asyncio.run(plagiscan_handlers.process_queue())
         plagiscan_handlers.process_anti_file.assert_awaited_once()
 
@@ -368,6 +946,86 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
         message.download = download
         return message
 
+    async def test_group_editor_route_delivers_both_reports_to_original_group_reply(self):
+        task = telegram_file_info(
+            "ordinary",
+            42,
+            "анти курсовая.docx",
+            chat_id=-100123,
+            message_id=777,
+        )
+        task["is_anti"] = True
+        task["force_plagiscan"] = False
+        settings = base_settings(
+            [],
+            telegram_group_routes={
+                "-100123": {
+                    "title": "Компания",
+                    "destination": "editor",
+                    "editor_nickname": "@group-editor",
+                }
+            },
+        )
+        sent = [SimpleNamespace(id=501, chat=SimpleNamespace(id=301))]
+        handlers, nik1, nik2 = await self._make_handlers_with_tasks([task], sent, settings)
+        tracking_key, tracking = next(iter(handlers.editor_tracking.items()))
+        self.assertEqual("@group-editor", tracking["destination"])
+        self.assertEqual(-100123, tracking["route_chat_id"])
+        self.assertEqual(777, tracking["route_message_id"])
+        self.assertTrue(tracking["route_is_group"])
+        self.assertEqual("@group-editor", nik2.send_document.await_args.kwargs["chat_id"])
+
+        normal_path = Path(tempfile.gettempdir()) / "group-normal.pdf"
+        ai_path = Path(tempfile.gettempdir()) / "group-ai.pdf"
+        normal_path.write_bytes(b"normal")
+        ai_path.write_bytes(b"ai")
+        client = SimpleNamespace(name="НИК-2")
+        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)):
+            await handlers.handle_editor_response(
+                client,
+                await self.make_response("анти курсовая.pdf", 501, 301, normal_path),
+            )
+            self.assertIn(tracking_key, handlers.editor_tracking)
+            await handlers.handle_editor_response(
+                client,
+                await self.make_response("ИИ анти курсовая.pdf", 501, 301, ai_path),
+            )
+
+        self.assertEqual(2, nik1.send_document.await_count)
+        self.assertEqual([-100123, -100123], [item.kwargs["chat_id"] for item in nik1.send_document.await_args_list])
+        self.assertEqual([777, 777], [item.kwargs["reply_to_message_id"] for item in nik1.send_document.await_args_list])
+        self.assertEqual(
+            {"анти курсовая.pdf", "ии анти курсовая.pdf"},
+            tracking["delivered_reports"],
+        )
+
+    async def test_two_group_routes_use_different_editors_for_same_named_files(self):
+        tasks = [
+            telegram_file_info("first", 1, "работа.docx", chat_id=-1001, message_id=10),
+            telegram_file_info("second", 2, "работа.docx", chat_id=-1002, message_id=20),
+        ]
+        for task in tasks:
+            task["is_anti"] = False
+            task["force_plagiscan"] = False
+        settings = base_settings(
+            [],
+            telegram_group_routes={
+                "-1001": {"title": "Первая", "destination": "editor", "editor_nickname": "@editor-one"},
+                "-1002": {"title": "Вторая", "destination": "editor", "editor_nickname": "@editor-two"},
+            },
+        )
+        sent = [
+            SimpleNamespace(id=601, chat=SimpleNamespace(id=401)),
+            SimpleNamespace(id=602, chat=SimpleNamespace(id=402)),
+        ]
+        handlers, _nik1, nik2 = await self._make_handlers_with_tasks(tasks, sent, settings)
+
+        self.assertEqual(
+            ["@editor-one", "@editor-two"],
+            [item.kwargs["chat_id"] for item in nik2.send_document.await_args_list],
+        )
+        self.assertEqual(2, len(handlers.editor_tracking))
+
     async def test_normal_and_ai_reports_are_delivered_immediately_once_and_replied_to_group(self):
         tasks = [
             telegram_file_info(
@@ -380,12 +1038,15 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
         ]
         settings = base_settings(
             ["forced"],
-            {"forced": {"destination": "editor", "editor_nickname": "@fixed-editor"}},
+            forced_authors_destination="editor",
+            forced_authors_editor_nickname="@fixed-editor",
         )
         sent = [SimpleNamespace(id=501, chat=SimpleNamespace(id=301))]
         handlers, nik1, _nik2 = await self._make_handlers_with_tasks(tasks, sent, settings)
         tracking_key, tracking = next(iter(handlers.editor_tracking.items()))
         self.assertEqual("@fixed-editor", tracking["destination"])
+        handlers._increment_files_today("telegram")
+        initial_count = handlers.files_today["count"]
 
         normal_path = Path(tempfile.gettempdir()) / "normal-result.pdf"
         ai_path = Path(tempfile.gettempdir()) / "ai-result.pdf"
@@ -424,6 +1085,8 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([b"normal", b"ai"], nik1.sent_contents)
         self.assertEqual(0, handlers.processor.crop_pdf.call_count)
+        self.assertEqual(initial_count, handlers.files_today["count"])
+        self.assertEqual(1, handlers.files_today["by_source"]["telegram"])
 
     async def test_same_message_id_in_different_editor_chats_keeps_tasks_separate(self):
         tasks = [
@@ -432,10 +1095,8 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
         ]
         settings = base_settings(
             ["author-a", "author-b"],
-            {
-                "author-a": {"destination": "editor", "editor_nickname": "@editor-a"},
-                "author-b": {"destination": "editor", "editor_nickname": "@editor-b"},
-            },
+            forced_authors_destination="editor",
+            forced_authors_editor_nickname="@shared-editor",
         )
         sent = [
             SimpleNamespace(id=600, chat=SimpleNamespace(id=401)),
@@ -464,7 +1125,8 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
         tasks = [telegram_file_info("author", 101, "работа.docx", message_id=1)]
         settings = base_settings(
             ["author"],
-            {"author": {"destination": "editor", "editor_nickname": "@editor"}},
+            forced_authors_destination="editor",
+            forced_authors_editor_nickname="@editor",
         )
         sent = [SimpleNamespace(id=600, chat=SimpleNamespace(id=401))]
         handlers, nik1, _nik2 = await self._make_handlers_with_tasks(tasks, sent, settings)
@@ -486,7 +1148,8 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
         ]
         settings = base_settings(
             ["forced"],
-            {"forced": {"destination": "editor", "editor_nickname": "@fixed-editor"}},
+            forced_authors_destination="editor",
+            forced_authors_editor_nickname="@fixed-editor",
         )
         sent = [SimpleNamespace(id=502, chat=SimpleNamespace(id=301))]
         handlers, nik1, _nik2 = await self._make_handlers_with_tasks(tasks, sent, settings)
@@ -521,7 +1184,8 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
         ]
         settings = base_settings(
             ["author"],
-            {"author": {"destination": "editor", "editor_nickname": "@editor"}},
+            forced_authors_destination="editor",
+            forced_authors_editor_nickname="@editor",
         )
         sent = [
             SimpleNamespace(id=610, chat=SimpleNamespace(id=401)),
@@ -551,7 +1215,8 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
     async def test_fixed_editor_no_checks_does_not_change_route_for_next_task(self):
         settings = base_settings(
             ["forced"],
-            {"forced": {"destination": "editor", "editor_nickname": "@fixed-editor"}},
+            forced_authors_destination="editor",
+            forced_authors_editor_nickname="@fixed-editor",
             mode="mode2",
         )
         sent = [
@@ -588,10 +1253,8 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
         ]
         settings = base_settings(
             ["author-a", "author-b"],
-            {
-                "author-a": {"destination": "editor", "editor_nickname": "@editor"},
-                "author-b": {"destination": "editor", "editor_nickname": "@editor"},
-            },
+            forced_authors_destination="editor",
+            forced_authors_editor_nickname="@editor",
         )
         sent = [
             SimpleNamespace(id=601, chat=SimpleNamespace(id=401)),
@@ -615,11 +1278,11 @@ class TestTelegramRouteContext(unittest.IsolatedAsyncioTestCase):
     async def test_normal_processing_error_requeues_group_context(self):
         manager = make_manager()
         client = MagicMock()
-        client.name = "НИК-3"
+        client.name = "legacy-1"
         client.send_message = AsyncMock()
         client.send_document = AsyncMock(side_effect=ValueError("invalid document"))
-        manager.clients = {"НИК-3": client}
-        manager.get_available_account.return_value = "НИК-3"
+        manager.clients = {"legacy-1": client}
+        manager.get_available_account.return_value = "legacy-1"
         manager.mark_account_busy = MagicMock()
         manager.mark_account_free = MagicMock()
         handlers = make_handlers(manager)
@@ -645,11 +1308,22 @@ class TestTelegramRouteContext(unittest.IsolatedAsyncioTestCase):
 
 
 class TestRequiredTelegramAccounts(unittest.TestCase):
-    def test_aaa_accounts_are_required_only_when_normal_route_uses_aaa(self):
+    def test_normal_account_setting_keeps_only_active_accounts(self):
+        old_settings = Config._SETTINGS
+        try:
+            Config._SETTINGS = {
+                "normal_accounts": ["НИК-2", "НИК-3", "legacy-account"],
+            }
+            Config._normalize_settings()
+            self.assertEqual(["НИК-2"], Config.get_setting("normal_accounts"))
+        finally:
+            Config._SETTINGS = old_settings
+
+    def test_only_first_two_accounts_are_required_in_every_mode(self):
         with patch(
             "config.Config.get_setting",
             side_effect=settings_lookup(
-                {"mode": "mode1", "normal_destination": "редактор", "normal_accounts": ["НИК-3"]}
+                {"mode": "mode1", "normal_destination": "редактор", "normal_accounts": ["legacy-1"]}
             ),
         ):
             self.assertEqual({"НИК-1", "НИК-2"}, AccountManager.required_account_names())
@@ -657,24 +1331,21 @@ class TestRequiredTelegramAccounts(unittest.TestCase):
         with patch(
             "config.Config.get_setting",
             side_effect=settings_lookup(
-                {"mode": "mode1", "normal_destination": "бот", "normal_accounts": ["НИК-3", "НИК-4"]}
+                {"mode": "mode1", "normal_destination": "бот", "normal_accounts": ["legacy-1", "legacy-2"]}
             ),
         ):
-            self.assertEqual(
-                {"НИК-1", "НИК-2", "НИК-3", "НИК-4"},
-                AccountManager.required_account_names(),
-            )
+            self.assertEqual({"НИК-1", "НИК-2"}, AccountManager.required_account_names())
 
     def test_client_initialization_skips_unused_aaa_accounts(self):
         manager = AccountManager()
         accounts = {
             name: {"api_id": 1, "api_hash": "hash", "phone": None}
-            for name in ("НИК-1", "НИК-2", "НИК-3", "НИК-4")
+            for name in ("НИК-1", "НИК-2", "legacy-1", "legacy-2")
         }
         settings = {
             "mode": "mode1",
             "normal_destination": "редактор",
-            "normal_accounts": ["НИК-3", "НИК-4"],
+            "normal_accounts": ["legacy-1", "legacy-2"],
         }
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -689,6 +1360,49 @@ class TestRequiredTelegramAccounts(unittest.TestCase):
 
         self.assertTrue(result)
         self.assertEqual({"НИК-1", "НИК-2"}, set(manager.clients))
+
+    def test_authorization_uses_only_the_two_active_accounts(self):
+        manager = AccountManager()
+        accounts = {
+            "НИК-1": {"api_id": 1, "api_hash": "hash1", "phone": "+1001"},
+            "НИК-2": {"api_id": 2, "api_hash": "hash2", "phone": "+1002"},
+            "legacy-account": {"api_id": 3, "api_hash": "hash3", "phone": "+1003"},
+        }
+
+        class FakeClient:
+            def __init__(self, name):
+                self.name = name
+                self.started = False
+                self.stopped = False
+
+            async def start(self):
+                self.started = True
+
+            async def get_me(self):
+                return SimpleNamespace(first_name=self.name, username=self.name.lower(), phone_number=None)
+
+            async def stop(self):
+                self.stopped = True
+
+        clients = {}
+
+        def make_client(**kwargs):
+            client = FakeClient(kwargs["name"])
+            clients[kwargs["name"]] = client
+            return client
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sessions_dir = Path(temp_dir) / "sessions"
+            with patch.object(Config, "load_config"), patch.object(
+                Config, "get_all_accounts", return_value=accounts
+            ), patch.object(Config, "SESSIONS_DIR", sessions_dir), patch(
+                "config.Client", side_effect=make_client
+            ), patch.object(Config, "save_config"), patch("builtins.input") as input_mock:
+                asyncio.run(manager.authorize_all_accounts())
+
+        self.assertEqual({"НИК-1", "НИК-2"}, set(clients))
+        self.assertTrue(all(client.started and client.stopped for client in clients.values()))
+        input_mock.assert_not_called()
 
 
 if __name__ == "__main__":

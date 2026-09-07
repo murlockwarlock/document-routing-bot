@@ -2664,30 +2664,50 @@ class BotHandlers:
         return any(_user_tokens_match(configured, candidate) for candidate in candidates)
 
     @staticmethod
-    def _configured_author_routes():
-        configured = Config.get_setting("plagiscan_user_routes", {}) or {}
-        if not isinstance(configured, dict):
-            return []
-        routes = []
-        for author, route in configured.items():
-            if isinstance(route, str):
-                route = {"destination": route}
-            if not isinstance(route, dict):
-                route = {}
-            author_text = str(author).strip()
-            if author_text:
-                routes.append((author_text, route))
-        return routes
-
-    @staticmethod
     def _is_telegram_group_message(message) -> bool:
         chat = getattr(message, "chat", None)
         chat_type = getattr(chat, "type", None)
         chat_type = getattr(chat_type, "value", chat_type)
         return str(chat_type or "").lower() in {"group", "supergroup"}
 
+    @staticmethod
+    def _configured_group_routes():
+        configured = Config.get_setting("telegram_group_routes", {}) or {}
+        return configured if isinstance(configured, dict) else {}
+
+    def _telegram_group_route_for_file_info(self, file_info: dict):
+        info = file_info or {}
+        if str(info.get("source_platform") or "telegram").lower() != "telegram":
+            return None
+        if not info.get("route_is_group"):
+            return None
+
+        chat_id = info.get("route_chat_id")
+        if chat_id is None:
+            return None
+        route = self._configured_group_routes().get(str(chat_id))
+        if not isinstance(route, dict):
+            return None
+
+        destination = str(route.get("destination") or "plagiscan").strip().lower()
+        if destination == "editor":
+            editor_nickname = str(route.get("editor_nickname") or "").strip()
+            if editor_nickname:
+                if not editor_nickname.startswith("@"):
+                    editor_nickname = "@" + editor_nickname
+                return {
+                    "destination": "editor",
+                    "editor_nickname": editor_nickname,
+                    "scope": "telegram_group",
+                }
+        return {"destination": "plagiscan", "scope": "telegram_group"}
+
     def get_force_author_route(self, file_info: dict):
         info = file_info or {}
+        group_route = self._telegram_group_route_for_file_info(info)
+        if group_route:
+            return group_route
+
         author = info.get("author")
         author_id = info.get("author_id")
         route_sender_id = info.get("route_sender_id")
@@ -2700,27 +2720,13 @@ class BotHandlers:
         ):
             return None
 
-        for configured, route in self._configured_author_routes():
-            if not self._force_author_entry_matches(
-                configured,
-                author=author,
-                author_id=author_id,
-                route_sender_id=route_sender_id,
-                route_sender_name=route_sender_name,
-            ):
-                continue
-            destination = str(route.get("destination") or route.get("route") or "plagiscan").strip().lower()
-            if destination == "editor":
-                editor_nickname = str(route.get("editor_nickname") or "").strip()
-                if editor_nickname:
-                    if not editor_nickname.startswith("@"):
-                        editor_nickname = "@" + editor_nickname
-                    return {
-                        "destination": "editor",
-                        "editor_nickname": editor_nickname,
-                    }
-            return {"destination": "plagiscan"}
-
+        destination = str(Config.get_setting("forced_authors_destination", "plagiscan") or "plagiscan").strip().lower()
+        if destination in {"editor", "редактор"}:
+            editor_nickname = str(Config.get_setting("forced_authors_editor_nickname", "") or "").strip()
+            if editor_nickname:
+                if not editor_nickname.startswith("@"):
+                    editor_nickname = "@" + editor_nickname
+                return {"destination": "editor", "editor_nickname": editor_nickname}
         return {"destination": "plagiscan"}
 
     def _anti_destination_for(self, file_info: dict) -> str:
@@ -3090,10 +3096,13 @@ class BotHandlers:
         await self.process_queue()
 
     def _get_normal_accounts(self):
-        return Config.get_setting("normal_accounts") or ["НИК-3", "НИК-4", "НИК-5", "НИК-6", "НИК-7"]
+        normal_accounts = Config.get_setting("normal_accounts") or []
+        if isinstance(normal_accounts, str):
+            normal_accounts = [item.strip() for item in normal_accounts.split(",") if item.strip()]
+        return [str(account).strip() for account in normal_accounts if str(account).strip()]
 
     def is_force_plagiscan_author(self, author=None, author_id=None, route_sender_id=None, route_sender_name=None):
-        """True если автор входит в отдельный список принудительной проверки через Plagiscan.
+        """True если автор входит в отдельный список принудительных авторов.
 
         Правила сопоставления:
         - Явная VK-запись (vk: / vk.com/ / https://vk.com/):
@@ -3117,12 +3126,8 @@ class BotHandlers:
         return False
 
     def is_force_plagiscan_file_info(self, file_info):
-        return self.is_force_plagiscan_author(
-            author=(file_info or {}).get("author"),
-            author_id=(file_info or {}).get("author_id"),
-            route_sender_id=(file_info or {}).get("route_sender_id"),
-            route_sender_name=(file_info or {}).get("route_sender_name"),
-        )
+        route = self.get_force_author_route(file_info)
+        return bool(route and route.get("destination") == "plagiscan")
 
     def _activate_global_aaa_unavailable(self, trigger_account=None):
         if not self.aaa_globally_unavailable:
@@ -3550,10 +3555,28 @@ class BotHandlers:
             # Синхронизируем с AccountManager
             asyncio.create_task(self.manager.set_file_status(file_uid, "DONE" if success else "FAILED"))
 
-    def is_author_allowed(self, username, author_id=None):
+    def is_author_allowed(
+        self,
+        username,
+        author_id=None,
+        *,
+        route_chat_id=None,
+        route_is_group=False,
+        source_platform="telegram",
+    ):
         """Проверка, разрешен ли автор (только для входящих сообщений от пользователей)"""
         # Очищаем username от @
         username_clean = username[1:] if username.startswith('@') else username
+
+        if self._telegram_group_route_for_file_info(
+            {
+                "source_platform": source_platform,
+                "route_chat_id": route_chat_id,
+                "route_is_group": route_is_group,
+            }
+        ):
+            print("✅ Сообщение из настроенной Telegram-беседы разрешено")
+            return True
 
         # Сначала проверяем, является ли это ожидаемым редактором
         for msg_id, tracking_info in self.editor_tracking.items():
@@ -3828,8 +3851,23 @@ class BotHandlers:
             await self.handle_bot_response(client, message)
             return
 
+        route_context = {
+            "author": author,
+            "author_id": message.from_user.id,
+            "source_platform": "telegram",
+            "route_chat_id": message.chat.id,
+            "route_message_id": message.id,
+            "route_is_group": self._is_telegram_group_message(message),
+        }
+
         # Проверяем разрешен ли автор
-        if not self.is_author_allowed(author, message.from_user.id):
+        if not self.is_author_allowed(
+            author,
+            message.from_user.id,
+            route_chat_id=route_context["route_chat_id"],
+            route_is_group=route_context["route_is_group"],
+            source_platform="telegram",
+        ):
             print(f"⛔ Автор {author} не в списке разрешенных. Игнорируем.")
             return
 
@@ -3843,18 +3881,23 @@ class BotHandlers:
             # Если отправитель — активный редактор (ожидаем ответ от него),
             # не применяем force_plagiscan — чтобы не было бесконечного цикла
             author_clean_fp = author[1:] if author.startswith('@') else author
+            configured_group_route = self._telegram_group_route_for_file_info(route_context)
             is_active_editor = any(
                 (info.get("destination", "").lstrip("@")).lower() == author_clean_fp.lower()
                 for info in self.editor_tracking.values()
-            )
-            force_plagiscan = (not is_active_editor) and self.is_force_plagiscan_author(
-                author=author,
-                author_id=message.from_user.id,
-            )
+            ) and not configured_group_route
+            forced_route = None if is_active_editor else self.get_force_author_route(route_context)
+            force_plagiscan = bool(forced_route and forced_route["destination"] == "plagiscan")
+            fixed_editor_route = bool(forced_route and forced_route["destination"] == "editor")
             print(f"📄 Файл: {file_name} (UID: {file_uid[:10]}...)")
             if force_plagiscan:
                 print(f"🛡️  Автор {author} в списке принудительной проверки: файл пойдет в Плагискан")
                 self._log_plagiscan(f"🛡️  force_plagiscan author={author} file={file_name}")
+            elif fixed_editor_route:
+                print(f"👤 Файл направлен назначенному редактору: {forced_route['editor_nickname']}")
+                self._log_editor(
+                    f"👤 Фиксированный маршрут автора/беседы: {forced_route['editor_nickname']} | file={file_name}"
+                )
             elif is_active_editor:
                 print(f"ℹ️  Автор {author} — активный редактор, force_plagiscan пропущен")
 
@@ -3899,7 +3942,7 @@ class BotHandlers:
 
         # ВАЖНОЕ ИСПРАВЛЕНИЕ: Проверяем режим 2 для ВСЕХ файлов (анти и обычных)
         current_mode = Config.get_setting("mode")
-        if current_mode == "mode2" and message.document and not force_plagiscan:
+        if current_mode == "mode2" and message.document and not force_plagiscan and not fixed_editor_route:
             should_send_to_editor = False
             reason = ""
 
@@ -3929,6 +3972,9 @@ class BotHandlers:
                     "route_is_group": self._is_telegram_group_message(message),
                     "is_anti": self.processor.is_anti_file(file_name) or force_plagiscan,
                     "force_plagiscan": force_plagiscan,
+                    "forced_route": forced_route,
+                    "fixed_author_editor_route": fixed_editor_route,
+                    "forced_editor_nickname": forced_route.get("editor_nickname") if fixed_editor_route else None,
                     "received_at": datetime.now(),
                     "status": f"отправлен редактору ({reason})",
                     "message": message,
@@ -3970,6 +4016,9 @@ class BotHandlers:
                 "route_is_group": self._is_telegram_group_message(message),
                 "is_anti": self.processor.is_anti_file(file_name) or force_plagiscan,
                 "force_plagiscan": force_plagiscan,
+                "forced_route": forced_route,
+                "fixed_author_editor_route": fixed_editor_route,
+                "forced_editor_nickname": forced_route.get("editor_nickname") if fixed_editor_route else None,
                 "received_at": datetime.now(),
                 "status": "в очереди",
                 "message": message,
@@ -4211,6 +4260,10 @@ class BotHandlers:
         chosen_is_anti = False
 
         for i, f in enumerate(self.manager.file_queue):
+            queued_route = f.get("forced_route") or self.get_force_author_route(f)
+            if queued_route and queued_route.get("destination") == "editor":
+                chosen_idx = i
+                break
             if f.get("is_anti") and not chosen_is_anti:
                 chosen_idx = i
                 chosen_is_anti = True
@@ -4223,23 +4276,25 @@ class BotHandlers:
 
         file_info = self.manager.file_queue.pop(chosen_idx)
 
-        forced_route = self.get_force_author_route(file_info) if file_info.get("force_plagiscan") else None
+        forced_route = file_info.get("forced_route") or self.get_force_author_route(file_info)
         if forced_route:
-            file_info["force_plagiscan"] = True
             if forced_route["destination"] == "editor":
                 file_info["fixed_author_editor_route"] = True
                 file_info["forced_editor_nickname"] = forced_route["editor_nickname"]
+                file_info["force_plagiscan"] = False
                 file_info["sent_to_editor"] = True
-                file_info["reason"] = "индивидуальный маршрут принудительного автора"
+                file_info["reason"] = "назначенный маршрут принудительного автора или беседы"
                 self._log_editor(
-                    f"📌 Индивидуальный редактор принудительного автора: "
+                    f"📌 Назначенный редактор принудительного автора или беседы: "
                     f"{forced_route['editor_nickname']} | file={file_info.get('original_file_name', file_info.get('file_name'))}"
                 )
                 await self.send_to_nik2(
                     file_info,
-                    reason="индивидуальный маршрут принудительного автора",
+                    reason="назначенный маршрут принудительного автора или беседы",
                 )
                 return
+            file_info["force_plagiscan"] = True
+            file_info["is_anti"] = True
 
         current_mode = Config.get_setting("mode")
         normal_destination = Config.get_setting("normal_destination", "бот")
@@ -4502,7 +4557,7 @@ class BotHandlers:
             # Проверяем, что это не НИК-1 (который только для приема файлов)
             if account == "НИК-1":
                 print("❌ ОШИБКА: НИК-1 предназначен только для приема файлов, а не для отправки!")
-                print("   Проверьте настройку normal_accounts в config.json")
+                print("   Проверьте настройки аккаунтов Telegram")
                 self.manager.file_queue.insert(0, file_info)
                 return
 
@@ -4511,7 +4566,7 @@ class BotHandlers:
                 print(f"⛔ Аккаунт {account} заблокирован (нет проверок)")
                 
                 # Проверяем, остались ли еще живые аккаунты
-                normal_accounts = Config.get_setting("normal_accounts") or ["НИК-3", "НИК-4", "НИК-5", "НИК-6", "НИК-7"]
+                normal_accounts = self._get_normal_accounts()
                 alive_accounts = [acc for acc in normal_accounts if acc not in self.manager.blacklisted_accounts]
                 
                 if not alive_accounts:
@@ -6119,7 +6174,7 @@ class BotHandlers:
             self.manager.blacklist_account(client.name)  # менеджер сам печатает сообщение
 
             # Проверяем, остались ли еще живые аккаунты
-            normal_accounts = Config.get_setting("normal_accounts") or ["НИК-3", "НИК-4", "НИК-5", "НИК-6", "НИК-7"]
+            normal_accounts = self._get_normal_accounts()
             alive_accounts = [acc for acc in normal_accounts if acc not in self.manager.blacklisted_accounts]
 
             if processing_info.get("force_plagiscan"):

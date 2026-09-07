@@ -2157,12 +2157,12 @@ class TestAaaUploadFilename(unittest.TestCase):
         work_file.write_bytes(b"test content")
 
         manager = _make_account_manager()
-        manager.get_available_account.return_value = "НИК-3"
+        manager.get_available_account.return_value = "AAA-1"
         manager.mark_account_busy = Mock()
         manager.mark_account_free = Mock()
 
         mock_client = AsyncMock()
-        mock_client.name = "НИК-3"
+        mock_client.name = "AAA-1"
         mock_client.send_message = AsyncMock()
         mock_client.send_document = AsyncMock(
             return_value=SimpleNamespace(
@@ -2170,7 +2170,7 @@ class TestAaaUploadFilename(unittest.TestCase):
                 chat=SimpleNamespace(id=555),
             )
         )
-        manager.clients = {"НИК-3": mock_client}
+        manager.clients = {"AAA-1": mock_client}
 
         config_values = {
             "ai_bot": "@AAA_Report_AIBot",
@@ -2212,9 +2212,9 @@ class TestAaaUploadFilename(unittest.TestCase):
 
     def test_four_normal_accounts_available_when_config_has_four(self):
         manager = _make_account_manager()
-        with patch("bot_handlers.Config.get_setting", return_value=["НИК-3", "НИК-4", "НИК-5", "НИК-6"]):
+        with patch("bot_handlers.Config.get_setting", return_value=["AAA-1", "AAA-2", "AAA-3", "AAA-4"]):
             handlers = BotHandlers(manager)
-            self.assertEqual(["НИК-3", "НИК-4", "НИК-5", "НИК-6"], handlers._get_normal_accounts())
+            self.assertEqual(["AAA-1", "AAA-2", "AAA-3", "AAA-4"], handlers._get_normal_accounts())
 
 
 class TestRecoveryAndEditorRouting(unittest.TestCase):
@@ -2248,7 +2248,7 @@ class TestRecoveryAndEditorRouting(unittest.TestCase):
 
         with patch("bot_handlers.Config.get_setting", return_value=30):
             try:
-                asyncio.run(self.handlers._requeue_after_missing_ai_prompt("НИК-3", "file-key", file_info, str(temp_path)))
+                asyncio.run(self.handlers._requeue_after_missing_ai_prompt("AAA-1", "file-key", file_info, str(temp_path)))
             finally:
                 temp_dir.cleanup()
 
@@ -2283,7 +2283,7 @@ class TestRecoveryAndEditorRouting(unittest.TestCase):
         }
         self.handlers.current_processing_files["file-key"] = processing_info.copy()
 
-        client = SimpleNamespace(name="НИК-3")
+        client = SimpleNamespace(name="AAA-1")
         message = SimpleNamespace(id=10)
 
         asyncio.run(self.handlers._handle_global_aaa_unavailable(client, message, processing_info, "file-key"))
@@ -2479,7 +2479,7 @@ class TestRecoveryAndEditorRouting(unittest.TestCase):
         self.assertEqual("@editor247", tracking["destination"])
 
     def test_handle_no_more_checks_requeues_vk_file_when_other_accounts_alive(self):
-        self.handlers.manager.blacklisted_accounts = ["НИК-4"]
+        self.handlers.manager.blacklisted_accounts = ["AAA-2"]
         self.handlers.manager.blacklist_account = Mock()
         self.handlers.manager.mark_account_free = Mock()
         self.handlers.cleanup_account_mappings = Mock()
@@ -2500,13 +2500,13 @@ class TestRecoveryAndEditorRouting(unittest.TestCase):
             "route_sender_id": "42",
             "route_chat_id": "100",
             "temp_path": None,
-            "account": "НИК-3",
+            "account": "AAA-1",
         }
-        self.handlers.current_processing_files["file-key"] = {"account": "НИК-3"}
+        self.handlers.current_processing_files["file-key"] = {"account": "AAA-1"}
         message = SimpleNamespace(id=321, chat=SimpleNamespace(id=654))
-        client = SimpleNamespace(name="НИК-3")
+        client = SimpleNamespace(name="AAA-1")
 
-        with patch("bot_handlers.Config.get_setting", return_value=["НИК-3", "НИК-4", "НИК-5"]):
+        with patch("bot_handlers.Config.get_setting", return_value=["AAA-1", "AAA-2", "AAA-3"]):
             asyncio.run(self.handlers.handle_no_more_checks(client, message, processing_info, "file-key"))
 
         self.assertEqual(1, len(self.handlers.manager.file_queue))
@@ -2517,7 +2517,7 @@ class TestRecoveryAndEditorRouting(unittest.TestCase):
         self.assertEqual(88, requeued["gateway_job_id"])
 
     def test_handle_no_more_checks_sends_to_editor_when_all_accounts_exhausted(self):
-        self.handlers.manager.blacklisted_accounts = ["НИК-3", "НИК-4", "НИК-5"]
+        self.handlers.manager.blacklisted_accounts = ["AAA-1", "AAA-2", "AAA-3"]
         self.handlers.manager.blacklist_account = Mock()
         self.handlers.manager.mark_account_free = Mock()
         self.handlers.cleanup_account_mappings = Mock()
@@ -2539,13 +2539,13 @@ class TestRecoveryAndEditorRouting(unittest.TestCase):
             "route_sender_id": "42",
             "route_chat_id": "100",
             "temp_path": None,
-            "account": "НИК-3",
+            "account": "AAA-1",
         }
-        self.handlers.current_processing_files["file-key"] = {"account": "НИК-3"}
+        self.handlers.current_processing_files["file-key"] = {"account": "AAA-1"}
         message = SimpleNamespace(id=321, chat=SimpleNamespace(id=654))
-        client = SimpleNamespace(name="НИК-3")
+        client = SimpleNamespace(name="AAA-1")
 
-        with patch("bot_handlers.Config.get_setting", return_value=["НИК-3", "НИК-4", "НИК-5"]):
+        with patch("bot_handlers.Config.get_setting", return_value=["AAA-1", "AAA-2", "AAA-3"]):
             asyncio.run(self.handlers.handle_no_more_checks(client, message, processing_info, "file-key"))
 
         self.handlers.send_to_nik2.assert_awaited_once()
@@ -4219,7 +4219,7 @@ class TestParallelProcessing(unittest.TestCase):
         """Если max_concurrent=1 и уже 1 файл в обработке — второй не стартует."""
         h = _make_handlers()
         # manager.processing_files is what process_queue checks (not current_processing_files)
-        h.manager.processing_files = {"НИК-3": {"first.docx": {}}}
+        h.manager.processing_files = {"AAA-1": {"first.docx": {}}}
         h.manager.file_queue = [
             {"file_name": "second.docx", "original_file_name": "second.docx",
              "is_anti": False, "force_plagiscan": False}
@@ -4236,7 +4236,7 @@ class TestParallelProcessing(unittest.TestCase):
     def test_second_file_starts_when_slots_available(self):
         """max_concurrent=2, 1 файл уже обрабатывается → второй стартует."""
         h = _make_handlers()
-        h.manager.processing_files = {"НИК-3": {"first.docx": {}}}
+        h.manager.processing_files = {"AAA-1": {"first.docx": {}}}
         h.manager.file_queue = [
             {"file_name": "second.docx", "original_file_name": "second.docx",
              "is_anti": False, "force_plagiscan": False}
@@ -4895,15 +4895,15 @@ class TestAdditionalNoChecksHandling(unittest.TestCase):
             "file_uid": "uid-1",
             "local_path": None,
         }
-        h.current_processing_files[file_key] = {"account": "НИК-3"}
+        h.current_processing_files[file_key] = {"account": "AAA-1"}
         h.send_to_nik2 = AsyncMock()
         h.manager.blacklist_account = MagicMock()
         h.manager.mark_account_free = MagicMock()
         message = SimpleNamespace(chat=SimpleNamespace(id=55), id=66)
-        client = SimpleNamespace(name="НИК-3")
+        client = SimpleNamespace(name="AAA-1")
 
         with patch("bot_handlers.Config.get_setting", side_effect=lambda key, default=None: {
-            "normal_accounts": ["НИК-3", "НИК-4"],
+            "normal_accounts": ["AAA-1", "AAA-2"],
         }.get(key, default)):
             asyncio.run(h.handle_no_more_checks(client, message, processing_info, file_key))
 

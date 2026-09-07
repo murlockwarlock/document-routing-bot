@@ -140,7 +140,7 @@ class InboundGateway:
         Supports: vk:123, 123, @username, username, vk.com/username.
 
         Пользователи из plagiscan_users считаются разрешёнными автоматически —
-        они проходят принудительную проверку в Плагискане независимо от allowed_authors.
+        их маршрут определяется общей настройкой принудительных авторов.
         """
         try:
             from config import Config
@@ -170,7 +170,6 @@ class InboundGateway:
                     return True
 
             # Если пользователь в plagiscan_users — разрешаем, даже если не в allowed_authors.
-            # Файл позже будет направлен в Плагискан принудительно.
             for entry in plagiscan_users:
                 bare = InboundGateway._normalize_vk_id(str(entry))
                 if bare.isdigit() and bare == normalized_sender_id:
