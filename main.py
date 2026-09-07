@@ -689,7 +689,10 @@ class FileDistributionBot:
         accounts_configured = False
         configured_accounts = []
 
+        required_accounts = self.manager.required_account_names()
         for nickname, account in accounts.items():
+            if nickname not in required_accounts:
+                continue
             if account.get("api_id") and account.get("api_hash"):
                 configured_accounts.append(nickname)
 
@@ -806,6 +809,7 @@ class FileDistributionBot:
                                 message.reply_to_message_id,
                                 sent_from_account="НИК-2",
                                 message_text=message.text,
+                                reply_chat_id=getattr(getattr(message, "chat", None), "id", None),
                             )
                             if matched_info is None:
                                 return

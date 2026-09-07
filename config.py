@@ -41,6 +41,7 @@ class Config:
         "anti_destination": "бот",
         "anti_bot": "@plagaiscan_bot",
         "plagiscan_users": [],
+        "plagiscan_user_routes": {},
         "ai_bot": "@AAA_Report_AIBot",
         "editor_nickname": None,
         "anti_editor_nickname": None,
@@ -444,6 +445,7 @@ class Config:
         Config.update_setting("plagiscan_users", combined)
         if combined:
             print(f"✅ Пользователи Плагискана: {', '.join(combined)}")
+            Config.setup_plagiscan_user_routes_interactive(combined)
         else:
             print("✅ Список пользователей Плагискана очищен")
 
@@ -466,6 +468,63 @@ class Config:
         print("✅ ОБЩИЕ НАСТРОКИ СОХРАНЕНЫ!")
         print("=" * 50)
         Config.show_current_settings()
+
+    @staticmethod
+    def setup_plagiscan_user_routes_interactive(authors):
+        if not authors:
+            return
+
+        current_routes = Config.get_setting("plagiscan_user_routes", {}) or {}
+        if not isinstance(current_routes, dict):
+            current_routes = {}
+        routes = dict(current_routes)
+
+        print("\n📌 ИНДИВИДУАЛЬНЫЕ МАРШРУТЫ ПРИНУДИТЕЛЬНЫХ АВТОРОВ")
+        print("1. Plagiscan")
+        print("2. Конкретный редактор")
+
+        for author in authors:
+            current = routes.get(author) or {}
+            current_destination = str(current.get("destination", "plagiscan")).lower()
+            current_editor = current.get("editor_nickname") or ""
+            current_label = "Plagiscan"
+            if current_destination == "editor" and current_editor:
+                current_label = f"редактор {current_editor}"
+
+            while True:
+                choice = input(
+                    f"Маршрут для {author} (1 — Plagiscan, 2 — редактор) [Enter: {current_label}]: "
+                ).strip()
+                if not choice:
+                    if current_destination == "editor" and current_editor:
+                        routes[author] = {
+                            "destination": "editor",
+                            "editor_nickname": current_editor,
+                        }
+                    else:
+                        routes[author] = {"destination": "plagiscan"}
+                    break
+                if choice == "1":
+                    routes[author] = {"destination": "plagiscan"}
+                    break
+                if choice == "2":
+                    editor = input(
+                        f"Никнейм редактора для {author} [Enter: {current_editor or 'указать'}]: "
+                    ).strip()
+                    editor = editor or current_editor
+                    if editor and not editor.startswith("@"):
+                        editor = "@" + editor
+                    if editor:
+                        routes[author] = {
+                            "destination": "editor",
+                            "editor_nickname": editor,
+                        }
+                        break
+                    print("❌ Для маршрута к редактору нужен никнейм")
+                    continue
+                print("❌ Неверный выбор")
+
+        Config.update_setting("plagiscan_user_routes", routes)
 
     @staticmethod
     def show_current_settings():
@@ -565,6 +624,19 @@ class AccountManager:
         self.waiting_for_new_files = True
         self.blacklisted_accounts = []  # Аккаунты без проверок
 
+    @staticmethod
+    def required_account_names():
+        required = {"НИК-1", "НИК-2"}
+        normal_destination = Config.get_setting("normal_destination", "бот") or "бот"
+        if normal_destination == "бот":
+            normal_accounts = Config.get_setting("normal_accounts") or [
+                "НИК-3", "НИК-4", "НИК-5", "НИК-6", "НИК-7"
+            ]
+            if isinstance(normal_accounts, str):
+                normal_accounts = [item.strip() for item in normal_accounts.split(",") if item.strip()]
+            required.update(str(account).strip() for account in normal_accounts if str(account).strip())
+        return required
+
     async def init_all_clients(self):
         """Инициализация всех клиентов"""
         Config.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -576,8 +648,11 @@ class AccountManager:
         # Загружаем конфигурацию
         Config.load_config()
         accounts = Config.get_all_accounts()
+        required_accounts = self.required_account_names()
 
         for nickname, creds in accounts.items():
+            if nickname not in required_accounts:
+                continue
             if creds.get("api_id") and creds.get("api_hash"):
                 session_file = Config.get_session_name(nickname)
 
@@ -618,12 +693,15 @@ class AccountManager:
 
         # Получаем все аккаунты
         accounts = Config.get_all_accounts()
+        required_accounts = self.required_account_names()
 
-        if not accounts:
+        if not accounts or not required_accounts:
             print("❌ Нет аккаунтов в конфигурации!")
             return
 
         for nickname, creds in accounts.items():
+            if nickname not in required_accounts:
+                continue
             print(f"\n📱 Авторизация аккаунта: {nickname}")
             print("-" * 30)
 

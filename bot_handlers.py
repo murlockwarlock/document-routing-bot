@@ -2638,6 +2638,91 @@ class BotHandlers:
     def _has_plagiscan_user_filter(self) -> bool:
         return bool(self._configured_user_list("plagiscan_users"))
 
+    @staticmethod
+    def _is_explicit_vk_user_entry(entry: str) -> bool:
+        entry_lower = str(entry or "").strip().lower()
+        return (
+            entry_lower.startswith("vk:")
+            or entry_lower.startswith("vk.com/")
+            or entry_lower.startswith("https://vk.com/")
+            or entry_lower.startswith("http://vk.com/")
+        )
+
+    def _force_author_entry_matches(
+        self,
+        configured,
+        *,
+        author=None,
+        author_id=None,
+        route_sender_id=None,
+        route_sender_name=None,
+    ) -> bool:
+        if self._is_explicit_vk_user_entry(configured):
+            candidates = (route_sender_id, route_sender_name)
+        else:
+            candidates = (author, author_id, route_sender_id, route_sender_name)
+        return any(_user_tokens_match(configured, candidate) for candidate in candidates)
+
+    @staticmethod
+    def _configured_author_routes():
+        configured = Config.get_setting("plagiscan_user_routes", {}) or {}
+        if not isinstance(configured, dict):
+            return []
+        routes = []
+        for author, route in configured.items():
+            if isinstance(route, str):
+                route = {"destination": route}
+            if not isinstance(route, dict):
+                route = {}
+            author_text = str(author).strip()
+            if author_text:
+                routes.append((author_text, route))
+        return routes
+
+    @staticmethod
+    def _is_telegram_group_message(message) -> bool:
+        chat = getattr(message, "chat", None)
+        chat_type = getattr(chat, "type", None)
+        chat_type = getattr(chat_type, "value", chat_type)
+        return str(chat_type or "").lower() in {"group", "supergroup"}
+
+    def get_force_author_route(self, file_info: dict):
+        info = file_info or {}
+        author = info.get("author")
+        author_id = info.get("author_id")
+        route_sender_id = info.get("route_sender_id")
+        route_sender_name = info.get("route_sender_name")
+        if not self.is_force_plagiscan_author(
+            author=author,
+            author_id=author_id,
+            route_sender_id=route_sender_id,
+            route_sender_name=route_sender_name,
+        ):
+            return None
+
+        for configured, route in self._configured_author_routes():
+            if not self._force_author_entry_matches(
+                configured,
+                author=author,
+                author_id=author_id,
+                route_sender_id=route_sender_id,
+                route_sender_name=route_sender_name,
+            ):
+                continue
+            destination = str(route.get("destination") or route.get("route") or "plagiscan").strip().lower()
+            if destination == "editor":
+                editor_nickname = str(route.get("editor_nickname") or "").strip()
+                if editor_nickname:
+                    if not editor_nickname.startswith("@"):
+                        editor_nickname = "@" + editor_nickname
+                    return {
+                        "destination": "editor",
+                        "editor_nickname": editor_nickname,
+                    }
+            return {"destination": "plagiscan"}
+
+        return {"destination": "plagiscan"}
+
     def _anti_destination_for(self, file_info: dict) -> str:
         if (file_info or {}).get("force_plagiscan") or (file_info or {}).get("via_normal_destination"):
             return "бот"
@@ -2680,6 +2765,11 @@ class BotHandlers:
         stem = os.path.splitext(os.path.basename(str(file_name or "")))[0]
         return re.sub(r"\s+", " ", stem).strip().casefold()
 
+    @staticmethod
+    def _editor_report_key(file_name: str) -> str:
+        name = os.path.basename(str(file_name or ""))
+        return re.sub(r"\s+", " ", name).strip().casefold()
+
     @classmethod
     def _editor_tracking_keys(cls, tracking_info: dict) -> set[str]:
         names = {
@@ -2689,12 +2779,50 @@ class BotHandlers:
         }
         if tracking_info.get("original_name_without_ext"):
             names.add(f"{tracking_info.get('original_name_without_ext')}.pdf")
+        names.add(tracking_info.get("expected_ai_pdf_name"))
         return {key for key in (cls._editor_file_key(name) for name in names if name) if key}
 
     @classmethod
     def _editor_tracking_matches_file(cls, doc_name: str, tracking_info: dict) -> bool:
         doc_key = cls._editor_file_key(doc_name)
         return bool(doc_key and doc_key in cls._editor_tracking_keys(tracking_info or {}))
+
+    @staticmethod
+    def _new_editor_tracking_key(prefix: str, sent_message) -> str:
+        chat_id = getattr(getattr(sent_message, "chat", None), "id", None)
+        if chat_id is None:
+            return f"{prefix}_{sent_message.id}"
+        return f"{prefix}_{chat_id}_{sent_message.id}"
+
+    def _find_editor_tracking_by_reply(self, reply_to_message_id, chat_id=None, sent_from_account="НИК-2"):
+        if not reply_to_message_id:
+            return None, None
+
+        candidates = [
+            (key, info)
+            for key, info in self.editor_tracking.items()
+            if info.get("sent_from_account") == sent_from_account
+            and info.get("reply_to_message_id") == reply_to_message_id
+        ]
+        if chat_id is not None:
+            known_chat_candidates = [
+                (key, info) for key, info in candidates if info.get("chat_id") is not None
+            ]
+            chat_matches = [
+                (key, info)
+                for key, info in known_chat_candidates
+                if str(info.get("chat_id")) == str(chat_id)
+            ]
+            if len(chat_matches) == 1 and len(known_chat_candidates) == len(candidates):
+                return chat_matches[0]
+            if known_chat_candidates:
+                return None, None
+            if len(candidates) == 1:
+                return candidates[0]
+            return None, None
+        if len(candidates) == 1:
+            return candidates[0]
+        return None, None
 
     @staticmethod
     def _extract_editor_error_file_name(text: str) -> str | None:
@@ -2755,19 +2883,28 @@ class BotHandlers:
             return None, None, f"неоднозначное имя файла: {doc_name}"
         return None, None, f"нет точного совпадения имени файла: {doc_name}"
 
-    def find_editor_tracking_for_text_response(self, sender: str, reply_to_message_id, sent_from_account: str = "НИК-2", message_text: str | None = None):
+    def find_editor_tracking_for_text_response(
+        self,
+        sender: str,
+        reply_to_message_id,
+        sent_from_account: str = "НИК-2",
+        message_text: str | None = None,
+        reply_chat_id=None,
+    ):
         """Find editor tracking for a text response to a file sent through NIK-2."""
         sender_clean = str(sender or "").replace("@", "").lower()
 
         if reply_to_message_id:
-            for key, info in self.editor_tracking.items():
-                if info.get("sent_from_account") != sent_from_account:
-                    continue
-                if info.get("reply_to_message_id") != reply_to_message_id:
-                    continue
+            key, info = self._find_editor_tracking_by_reply(
+                reply_to_message_id,
+                chat_id=reply_chat_id,
+                sent_from_account=sent_from_account,
+            )
+            if info:
                 dest_clean = str(info.get("destination", "")).replace("@", "").lower()
                 if not sender_clean or not dest_clean or dest_clean == sender_clean:
                     return key, info, "reply_to sent editor message"
+            return None, None, "нет однозначного совпадения reply"
 
         text_file_name = self._extract_editor_error_file_name(message_text)
         if text_file_name:
@@ -2969,24 +3106,14 @@ class BotHandlers:
             return False
 
         for configured in configured_users:
-            entry = str(configured).strip()
-            entry_lower = entry.lower()
-            is_explicit_vk = (
-                entry_lower.startswith("vk:")
-                or entry_lower.startswith("vk.com/")
-                or entry_lower.startswith("https://vk.com/")
-                or entry_lower.startswith("http://vk.com/")
-            )
-            if is_explicit_vk:
-                # Только VK-поля
-                for candidate in (route_sender_id, route_sender_name):
-                    if _user_tokens_match(configured, candidate):
-                        return True
-            else:
-                # Любой другой формат — матчим и TG и VK
-                for candidate in (author, author_id, route_sender_id, route_sender_name):
-                    if _user_tokens_match(configured, candidate):
-                        return True
+            if self._force_author_entry_matches(
+                configured,
+                author=author,
+                author_id=author_id,
+                route_sender_id=route_sender_id,
+                route_sender_name=route_sender_name,
+            ):
+                return True
         return False
 
     def is_force_plagiscan_file_info(self, file_info):
@@ -3028,6 +3155,8 @@ class BotHandlers:
                 "source_platform": processing_info.get("source_platform", "telegram"),
                 "route_sender_id": processing_info.get("route_sender_id"),
                 "route_chat_id": processing_info.get("route_chat_id"),
+                "route_message_id": processing_info.get("route_message_id"),
+                "route_is_group": processing_info.get("route_is_group", False),
             }
 
             if not file_info_to_send["message"]:
@@ -3072,6 +3201,8 @@ class BotHandlers:
             "source_platform": file_info.get("source_platform", "telegram"),
             "route_sender_id": file_info.get("route_sender_id"),
             "route_chat_id": file_info.get("route_chat_id"),
+            "route_message_id": file_info.get("route_message_id"),
+            "route_is_group": file_info.get("route_is_group", False),
         }
         requeue_info["ai_prompt_retry_count"] = file_info.get("ai_prompt_retry_count", 0) + 1
 
@@ -3234,11 +3365,32 @@ class BotHandlers:
             if not client_nik1:
                 raise RuntimeError("Аккаунт НИК-1 не найден для отправки результата")
 
-            recipient = context.get("author_id") or context.get("route_sender_id") or context.get("author")
-            if isinstance(recipient, str) and recipient.isdigit():
+            route_chat_id = context.get("route_chat_id")
+            recipient = (
+                route_chat_id
+                if route_chat_id is not None
+                else context.get("author_id") or context.get("route_sender_id") or context.get("author")
+            )
+            if isinstance(recipient, str) and re.fullmatch(r"-?\d+", recipient):
                 recipient = int(recipient)
             elif isinstance(recipient, str) and not recipient.startswith("@"):
                 recipient = f"@{recipient}"
+
+            route_is_group = context.get("route_is_group")
+            if route_is_group is None:
+                route_is_group = (
+                    route_chat_id is not None
+                    and context.get("author_id") is not None
+                    and str(route_chat_id) != str(context.get("author_id"))
+                )
+            send_kwargs = {
+                "chat_id": recipient,
+                "document": document_path,
+                "file_name": file_name,
+                "caption": caption[:1024] if caption else None,
+            }
+            if route_is_group and context.get("route_message_id") is not None:
+                send_kwargs["reply_to_message_id"] = context["route_message_id"]
 
             if not client_nik1.is_connected:
                 try:
@@ -3251,12 +3403,7 @@ class BotHandlers:
             for attempt in range(2):
                 try:
                     await asyncio.wait_for(
-                        client_nik1.send_document(
-                            chat_id=recipient,
-                            document=document_path,
-                            file_name=file_name,
-                            caption=caption[:1024] if caption else None,
-                        ),
+                        client_nik1.send_document(**send_kwargs),
                         timeout=60,
                     )
                     self._log_gateway(f"deliver_result platform=telegram recipient={recipient} file_name={file_name}")
@@ -3291,6 +3438,8 @@ class BotHandlers:
                 "chat_id": context.get("route_chat_id") or context.get("chat_id"),
                 "sender_id": context.get("route_sender_id") or context.get("author_id") or context.get("author"),
             }
+            if route_is_group and context.get("route_message_id") is not None:
+                route["reply_to_message_id"] = context["route_message_id"]
             try:
                 manifest = self.outbound_dispatcher.outbox.spool_delivery(
                     source_platform="telegram",
@@ -3401,7 +3550,7 @@ class BotHandlers:
             # Синхронизируем с AccountManager
             asyncio.create_task(self.manager.set_file_status(file_uid, "DONE" if success else "FAILED"))
 
-    def is_author_allowed(self, username):
+    def is_author_allowed(self, username, author_id=None):
         """Проверка, разрешен ли автор (только для входящих сообщений от пользователей)"""
         # Очищаем username от @
         username_clean = username[1:] if username.startswith('@') else username
@@ -3432,14 +3581,11 @@ class BotHandlers:
         # В Telegram-входе здесь нет route_sender_id/name, поэтому явные vk: записи
         # не считаем Telegram-авторами.
         for entry in self._configured_user_list("plagiscan_users"):
-            entry_lower = entry.lower()
-            is_explicit_vk = (
-                entry_lower.startswith("vk:")
-                or entry_lower.startswith("vk.com/")
-                or entry_lower.startswith("https://vk.com/")
-                or entry_lower.startswith("http://vk.com/")
-            )
-            if not is_explicit_vk and _user_tokens_match(entry, username):
+            if self._force_author_entry_matches(
+                entry,
+                author=username,
+                author_id=author_id,
+            ):
                 return True
 
         # Получаем список разрешенных авторов из настроек
@@ -3450,7 +3596,7 @@ class BotHandlers:
             return True
 
         for entry in allowed_authors:
-            if _user_tokens_match(entry, username):
+            if _user_tokens_match(entry, username) or _user_tokens_match(entry, author_id):
                 return True
 
         # Для VK файлов: принимаем и "vk:123" и просто "123" в allowed_authors
@@ -3637,6 +3783,7 @@ class BotHandlers:
                 author,
                 message.reply_to_message_id,
                 message_text=message.text,
+                reply_chat_id=getattr(getattr(message, "chat", None), "id", None),
             )
             if tracking_key:
                 if not message.reply_to_message_id and tracking_info.get("reply_to_message_id"):
@@ -3682,7 +3829,7 @@ class BotHandlers:
             return
 
         # Проверяем разрешен ли автор
-        if not self.is_author_allowed(author):
+        if not self.is_author_allowed(author, message.from_user.id):
             print(f"⛔ Автор {author} не в списке разрешенных. Игнорируем.")
             return
 
@@ -3777,6 +3924,9 @@ class BotHandlers:
                     "file_name": file_name,
                     "message_id": message.id,
                     "chat_id": message.chat.id,
+                    "route_chat_id": message.chat.id,
+                    "route_message_id": message.id,
+                    "route_is_group": self._is_telegram_group_message(message),
                     "is_anti": self.processor.is_anti_file(file_name) or force_plagiscan,
                     "force_plagiscan": force_plagiscan,
                     "received_at": datetime.now(),
@@ -3815,6 +3965,9 @@ class BotHandlers:
                 "file_name": file_name,
                 "message_id": message.id,
                 "chat_id": message.chat.id,
+                "route_chat_id": message.chat.id,
+                "route_message_id": message.id,
+                "route_is_group": self._is_telegram_group_message(message),
                 "is_anti": self.processor.is_anti_file(file_name) or force_plagiscan,
                 "force_plagiscan": force_plagiscan,
                 "received_at": datetime.now(),
@@ -3955,6 +4108,8 @@ class BotHandlers:
                 "source_platform": file_info.get("source_platform", "telegram") if file_info else "telegram",
                 "route_sender_id": file_info.get("route_sender_id") if file_info else None,
                 "route_chat_id": file_info.get("route_chat_id") if file_info else None,
+                "route_message_id": file_info.get("route_message_id") if file_info else None,
+                "route_is_group": file_info.get("route_is_group", False) if file_info else False,
                 "gateway_job_id": file_info.get("gateway_job_id") if file_info else None,
                 "local_path": file_info.get("local_path") if file_info else None,
                 "message": file_info.get("message") if file_info else message,
@@ -4067,6 +4222,24 @@ class BotHandlers:
             return
 
         file_info = self.manager.file_queue.pop(chosen_idx)
+
+        forced_route = self.get_force_author_route(file_info) if file_info.get("force_plagiscan") else None
+        if forced_route:
+            file_info["force_plagiscan"] = True
+            if forced_route["destination"] == "editor":
+                file_info["fixed_author_editor_route"] = True
+                file_info["forced_editor_nickname"] = forced_route["editor_nickname"]
+                file_info["sent_to_editor"] = True
+                file_info["reason"] = "индивидуальный маршрут принудительного автора"
+                self._log_editor(
+                    f"📌 Индивидуальный редактор принудительного автора: "
+                    f"{forced_route['editor_nickname']} | file={file_info.get('original_file_name', file_info.get('file_name'))}"
+                )
+                await self.send_to_nik2(
+                    file_info,
+                    reason="индивидуальный маршрут принудительного автора",
+                )
+                return
 
         current_mode = Config.get_setting("mode")
         normal_destination = Config.get_setting("normal_destination", "бот")
@@ -4221,6 +4394,8 @@ class BotHandlers:
                     "source_platform": file_info.get("source_platform", "telegram"),
                     "route_sender_id": file_info.get("route_sender_id"),
                     "route_chat_id": file_info.get("route_chat_id"),
+                    "route_message_id": file_info.get("route_message_id"),
+                    "route_is_group": file_info.get("route_is_group", False),
                     "gateway_job_id": file_info.get("gateway_job_id"),
                     "local_path": file_info.get("local_path"),
                     "message": file_info.get("message"),
@@ -4253,6 +4428,8 @@ class BotHandlers:
                     "route_sender_id": file_info.get("route_sender_id"),
                     "route_chat_id": file_info.get("route_chat_id"),
                     "route_sender_name": file_info.get("route_sender_name"),
+                    "route_message_id": file_info.get("route_message_id"),
+                    "route_is_group": file_info.get("route_is_group", False),
                     "force_plagiscan": file_info.get("force_plagiscan", False),
                     "via_normal_destination": file_info.get("via_normal_destination", False),
                 }
@@ -4393,7 +4570,10 @@ class BotHandlers:
                 "gateway_job_id": file_info.get("gateway_job_id"),
                 "source_platform": file_info.get("source_platform", "telegram"),
                 "route_sender_id": file_info.get("route_sender_id"),
+                "route_sender_name": file_info.get("route_sender_name"),
                 "route_chat_id": file_info.get("route_chat_id"),
+                "route_message_id": file_info.get("route_message_id"),
+                "route_is_group": file_info.get("route_is_group", False),
             }
 
             # Отправляем /check перед отправкой файла
@@ -4490,6 +4670,12 @@ class BotHandlers:
                         "sent_to_editor": False, "file_uid": info.get("file_uid"),
                         "local_path": info.get("local_path"),
                         "gateway_job_id": info.get("gateway_job_id"),
+                        "source_platform": info.get("source_platform", "telegram"),
+                        "route_sender_id": info.get("route_sender_id"),
+                        "route_sender_name": info.get("route_sender_name"),
+                        "route_chat_id": info.get("route_chat_id"),
+                        "route_message_id": info.get("route_message_id"),
+                        "route_is_group": info.get("route_is_group", False),
                     }
                     self.manager.file_queue.insert(0, requeue_info)
                     print(f"🔄 Файл возвращён в очередь для повторной попытки")
@@ -4546,8 +4732,9 @@ class BotHandlers:
             # Определяем получателя
             current_mode = Config.get_setting("mode")
             destination = None
+            fixed_author_editor_route = bool(file_info.get("fixed_author_editor_route"))
 
-            if current_mode == "mode2":
+            if current_mode == "mode2" and not fixed_author_editor_route:
                 mode2_247_reasons = (
                     "вне рабочего времени",
                     "превышен заданный лимит проверок",
@@ -4600,6 +4787,8 @@ class BotHandlers:
                         "source_platform": file_info.get("source_platform", "telegram"),
                         "route_sender_id": file_info.get("route_sender_id"),
                         "route_chat_id": file_info.get("route_chat_id"),
+                        "route_message_id": file_info.get("route_message_id"),
+                        "route_is_group": file_info.get("route_is_group", False),
                         "gateway_job_id": file_info.get("gateway_job_id"),
                         "local_path": file_info.get("local_path"),
                         "message": file_info.get("message"),
@@ -4618,10 +4807,18 @@ class BotHandlers:
                     self._log_editor(f"📝 Ожидаю PDF файл: {original_name_without_ext}.pdf от редактора")
 
             else:
-                editor_nickname = self._editor_for_file(file_info)
+                editor_nickname = (
+                    file_info.get("forced_editor_nickname")
+                    if fixed_author_editor_route
+                    else self._editor_for_file(file_info)
+                )
                 if editor_nickname:
                     destination = editor_nickname
-                    route_to_24_7 = self._is_editor_unavailable(destination) and Config.get_setting("editor_24_7")
+                    route_to_24_7 = (
+                        not fixed_author_editor_route
+                        and self._is_editor_unavailable(destination)
+                        and Config.get_setting("editor_24_7")
+                    )
                     if route_to_24_7:
                         destination = Config.get_setting("editor_24_7")
                         print(f"📤 Редактор недоступен, отправляем файл круглосуточному редактору через НИК-2: {destination}")
@@ -4638,7 +4835,11 @@ class BotHandlers:
 
                     original_name = file_info.get("original_file_name", file_info["file_name"])
                     original_name_without_ext = os.path.splitext(original_name)[0]
-                    tracking_key = f"no_checks_{sent_msg.id}"
+                    tracking_key = (
+                        self._new_editor_tracking_key("fixed_editor", sent_msg)
+                        if fixed_author_editor_route
+                        else f"no_checks_{sent_msg.id}"
+                    )
 
                     self.editor_tracking[tracking_key] = {
                         "author": file_info["author"],
@@ -4656,6 +4857,8 @@ class BotHandlers:
                         "source_platform": file_info.get("source_platform", "telegram"),
                         "route_sender_id": file_info.get("route_sender_id"),
                         "route_chat_id": file_info.get("route_chat_id"),
+                        "route_message_id": file_info.get("route_message_id"),
+                        "route_is_group": file_info.get("route_is_group", False),
                         "gateway_job_id": file_info.get("gateway_job_id"),
                         "local_path": file_info.get("local_path"),
                         "message": file_info.get("message"),
@@ -4663,6 +4866,15 @@ class BotHandlers:
                         "force_plagiscan": file_info.get("force_plagiscan", False),
                         "via_normal_destination": file_info.get("via_normal_destination", False),
                     }
+                    if fixed_author_editor_route:
+                        self.editor_tracking[tracking_key].update(
+                            {
+                                "expected_ai_pdf_name": f"ИИ {original_name_without_ext}.pdf",
+                                "delivered_reports": set(),
+                                "fixed_author_editor_route": True,
+                                "account_released": False,
+                            }
+                        )
                     await self._mark_gateway_job_waiting_editor(
                         file_info,
                         "waiting_editor247_response" if route_to_24_7 else "waiting_editor_response",
@@ -4696,16 +4908,10 @@ class BotHandlers:
                     return
             else:
                 # Для НИК-2 ищем tracking по специальному ключу
-                tracking_key = f"anti_editor_{message.reply_to_message_id}"
-                tracking_info = self.editor_tracking.get(tracking_key)
-                if not tracking_info:
-                    # Пробуем обычный поиск
-                    for key, info in self.editor_tracking.items():
-                        if info.get("sent_from_account") == "НИК-2" and info.get(
-                                "reply_to_message_id") == message.reply_to_message_id:
-                            tracking_info = info
-                            tracking_key = key
-                            break
+                tracking_key, tracking_info = self._find_editor_tracking_by_reply(
+                    message.reply_to_message_id,
+                    chat_id=getattr(getattr(message, "chat", None), "id", None),
+                )
 
                 if not tracking_info:
                     print(f"⚠️  Не найдена информация об отправке для сообщения {message.reply_to_message_id} в НИК-2")
@@ -4777,6 +4983,16 @@ class BotHandlers:
             self._log_editor(f"✅ Редактор вернул PDF: {file_name}")
 
             if not self._editor_tracking_matches_file(file_name, tracking_info):
+                if message.reply_to_message_id:
+                    print(
+                        f"⚠️  PDF от редактора не отправлен: имя {file_name} "
+                        "не соответствует задаче из reply"
+                    )
+                    self._log_editor(
+                        f"⚠️ PDF от редактора не отправлен: file={file_name} "
+                        f"tracking={tracking_info.get('original_name')} — reply mismatch"
+                    )
+                    return
                 sender = message.from_user.username or str(message.from_user.id) if getattr(message, "from_user", None) else ""
                 matched_key, matched_info, reason = self.find_editor_tracking_for_unreplied_pdf(
                     sender,
@@ -4792,6 +5008,14 @@ class BotHandlers:
                         f"⚠️ PDF от редактора не отправлен: file={file_name} "
                         f"tracking={tracking_info.get('original_name')} reason={reason}"
                     )
+                    return
+
+            if tracking_info.get("fixed_author_editor_route"):
+                delivered_reports = tracking_info.setdefault("delivered_reports", set())
+                report_key = self._editor_report_key(file_name)
+                if report_key in delivered_reports:
+                    print(f"⏭️  PDF редактора уже доставлен: {file_name}")
+                    self._log_editor(f"⏭️ PDF редактора уже доставлен повторно: {file_name}")
                     return
 
             # Редакторский PDF отправляем с тем именем, которое вернул редактор.
@@ -4841,8 +5065,9 @@ class BotHandlers:
 
                 print(f"📁 Файл: {deliver_file_name} ({'обрезан' if tracking_info.get('is_anti_file') else 'без обрезки'})", flush=True)
                 self._finish_processing(tracking_info.get("file_uid"), sent_ok)
-                if sent_ok:
+                if sent_ok and not tracking_info.get("gateway_job_completed"):
                     await self._mark_gateway_job_done(tracking_info, temp_path, "editor_response_delivered")
+                    tracking_info["gateway_job_completed"] = True
 
             else:
                 # Старая логика для НИК-1
@@ -4883,25 +5108,31 @@ class BotHandlers:
                     print("❌ PDF не доставлен (НИК-1) — все попытки исчерпаны", flush=True)
 
                 self._finish_processing(tracking_info.get("file_uid"), sent_ok)
-                if sent_ok:
+                if sent_ok and not tracking_info.get("gateway_job_completed"):
                     await self._mark_gateway_job_done(tracking_info, final_path, "editor_response_delivered")
+                    tracking_info["gateway_job_completed"] = True
+
+            if tracking_info.get("fixed_author_editor_route") and sent_ok:
+                tracking_info.setdefault("delivered_reports", set()).add(self._editor_report_key(file_name))
 
             # Удаляем из отслеживания
-            if client.name == "НИК-2":
+            if not tracking_info.get("fixed_author_editor_route") and client.name == "НИК-2":
                 # Удаляем по специальному ключу
                 if tracking_key in self.editor_tracking:
                     del self.editor_tracking[tracking_key]
                     print(f"🗑️  Удален из отслеживания: {tracking_key}")
-            elif message.reply_to_message_id in self.editor_tracking:
+            elif not tracking_info.get("fixed_author_editor_route") and message.reply_to_message_id in self.editor_tracking:
                 del self.editor_tracking[message.reply_to_message_id]
                 print(f"🗑️  Удален из отслеживания: {message.reply_to_message_id}")
 
             # Освобождаем аккаунт НИК-2 если он был занят
             if tracking_info.get('sent_from_account') == "НИК-2":
-                anti_file_name = tracking_info.get('original_name', '')
-                self.manager.mark_account_free("НИК-2", anti_file_name)
-                print(f"🔄 Аккаунт НИК-2 освобожден от файла: {anti_file_name}")
-                asyncio.create_task(self.process_queue())
+                if not tracking_info.get("fixed_author_editor_route") or not tracking_info.get("account_released"):
+                    anti_file_name = tracking_info.get('original_name', '')
+                    self.manager.mark_account_free("НИК-2", anti_file_name)
+                    tracking_info["account_released"] = True
+                    print(f"🔄 Аккаунт НИК-2 освобожден от файла: {anti_file_name}")
+                    asyncio.create_task(self.process_queue())
 
             # Удаляем временные файлы
             if os.path.exists(temp_path):
@@ -5378,6 +5609,8 @@ class BotHandlers:
                     "route_sender_id": processing_info.get("route_sender_id"),
                     "route_sender_name": processing_info.get("route_sender_name"),
                     "route_chat_id": processing_info.get("route_chat_id"),
+                    "route_message_id": processing_info.get("route_message_id"),
+                    "route_is_group": processing_info.get("route_is_group", False),
                     "is_anti": is_anti,
                 }
                 await self.send_to_nik2(file_info_for_editor, reason=reason)
@@ -5832,6 +6065,8 @@ class BotHandlers:
                 "source_platform": processing_info.get("source_platform", "telegram"),
                 "route_sender_id": processing_info.get("route_sender_id"),
                 "route_chat_id": processing_info.get("route_chat_id"),
+                "route_message_id": processing_info.get("route_message_id"),
+                "route_is_group": processing_info.get("route_is_group", False),
                 "gateway_job_id": processing_info.get("gateway_job_id"),
             }
             await self._mark_gateway_job_waiting_editor(processing_info, "waiting_editor_response_after_aaa_error")
@@ -5914,6 +6149,8 @@ class BotHandlers:
                     "source_platform": processing_info.get("source_platform", "telegram"),
                     "route_sender_id": processing_info.get("route_sender_id"),
                     "route_chat_id": processing_info.get("route_chat_id"),
+                    "route_message_id": processing_info.get("route_message_id"),
+                    "route_is_group": processing_info.get("route_is_group", False),
                 }
 
                 if file_info["message"] or file_info.get("local_path"):
@@ -5937,6 +6174,8 @@ class BotHandlers:
                     "source_platform": processing_info.get("source_platform", "telegram"),
                     "route_sender_id": processing_info.get("route_sender_id"),
                     "route_chat_id": processing_info.get("route_chat_id"),
+                    "route_message_id": processing_info.get("route_message_id"),
+                    "route_is_group": processing_info.get("route_is_group", False),
                 }
 
                 # Если сообщения нет в processing_info, попробуем использовать текущее (хотя оно от бота)
