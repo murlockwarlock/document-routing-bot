@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import signal
 import sys
 import os
@@ -812,9 +813,11 @@ class FileDistributionBot:
                                 f"ℹ️ Текст от редактора {sender} привязан: "
                                 f"{tracking_key} ({reason})"
                             )
+                            response_message = message
                             if not message.reply_to_message_id:
-                                message.reply_to_message_id = matched_info["reply_to_message_id"]
-                            await self.handlers.handle_editor_response(client, message)
+                                response_message = copy.copy(message)
+                                response_message.reply_to_message_id = matched_info["reply_to_message_id"]
+                            await self.handlers.handle_editor_response(client, response_message)
                             return
 
                         if message.document and message.document.file_name.lower().endswith('.pdf'):
@@ -837,8 +840,9 @@ class FileDistributionBot:
                                         f"ℹ️ PDF от редактора {sender} привязан без reply: "
                                         f"{doc_name} -> {tracking_key} ({reason})"
                                     )
-                                    message.reply_to_message_id = matched_info["reply_to_message_id"]
-                                    await self.handlers.handle_editor_response(client, message)
+                                    response_message = copy.copy(message)
+                                    response_message.reply_to_message_id = matched_info["reply_to_message_id"]
+                                    await self.handlers.handle_editor_response(client, response_message)
 
                 normal_accounts = settings.get("normal_accounts") or []
                 if nickname in normal_accounts:

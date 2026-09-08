@@ -3539,8 +3539,12 @@ class TestEditorResponseOriginalFilename(unittest.IsolatedAsyncioTestCase):
         client.name = "НИК-2"
         await handlers.handle_main_account(client, msg)
 
-        self.assertEqual(705, msg.reply_to_message_id)
-        handlers.handle_editor_response.assert_awaited_once_with(client, msg)
+        self.assertIsNone(msg.reply_to_message_id)
+        handlers.handle_editor_response.assert_awaited_once()
+        response_message = handlers.handle_editor_response.await_args.args[1]
+        self.assertIsNot(msg, response_message)
+        self.assertEqual(client, handlers.handle_editor_response.await_args.args[0])
+        self.assertEqual(705, response_message.reply_to_message_id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
