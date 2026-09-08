@@ -168,7 +168,7 @@ class TestForcePlagiscanRouting(unittest.TestCase):
         with patch("bot_handlers.Config.get_setting", side_effect=lambda key, default=None: settings.get(key, default)):
             self.assertTrue(self.handlers.is_author_allowed("antiplagiadbot"))
 
-    def test_mode2_editor_send_preserves_original_file_name(self):
+    def test_mode2_editor_send_uses_transport_and_preserves_original_file_name(self):
         temp_file = Path(tempfile.gettempdir()) / "editor247_work_copy.docx"
         temp_file.write_bytes(b"data")
         client = MagicMock()
@@ -195,7 +195,8 @@ class TestForcePlagiscanRouting(unittest.TestCase):
 
         client.send_document.assert_awaited_once()
         _, kwargs = client.send_document.await_args
-        self.assertEqual("357517.docx", kwargs["file_name"])
+        self.assertRegex(kwargs["file_name"], r"^357517__job[1-9][0-9]*\.docx$")
+        self.assertEqual("357517.docx", file_info["original_file_name"])
 
     def test_force_plagiscan_overrides_anti_destination_editor(self):
         handlers = _make_handlers()

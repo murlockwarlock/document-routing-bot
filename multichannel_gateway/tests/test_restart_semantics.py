@@ -101,7 +101,7 @@ class RestartSemanticsTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual({}, state)
         await bot.handlers.handle_main_account(bot.manager.clients["НИК-1"], self.source(name="Новая.docx"))
         self.assertEqual(1, bot.manager.clients["НИК-2"].send_document.await_count)
-        await bot.handlers.handle_editor_response(bot.manager.clients["НИК-2"], self.report(name="Новая.pdf"))
+        await bot.handlers.handle_editor_response(bot.manager.clients["НИК-2"], self.report(name=next(iter(bot.handlers.editor_tracking.values()))["expected_pdf_name"]))
         sent = bot.manager.clients["НИК-1"].send_document.await_args.kwargs
         self.assertEqual((-100123, 1), (sent["chat_id"], sent["reply_to_message_id"]))
         self.assertEqual(1, bot.handlers.files_today["count"])
@@ -122,6 +122,28 @@ class RestartSemanticsTests(unittest.IsolatedAsyncioTestCase):
         await bot.handlers.handle_editor_response(bot.manager.clients["НИК-2"], self.report(new_info["reply_to_message_id"]))
         bot.manager.clients["НИК-1"].send_document.assert_awaited_once()
 
+    async def test_old_token_rejected_new_same_name_token_bypasses_restart_history(self):
+        old = self.bot()
+        await old.handlers.handle_main_account(old.manager.clients["НИК-1"], self.source())
+        old_info = next(iter(old.handlers.editor_tracking.values()))
+        bot = await self.restart()
+        await bot.handlers.handle_editor_response(bot.manager.clients["НИК-2"], self.report(name=old_info["expected_pdf_name"]))
+        await bot.handlers.handle_main_account(bot.manager.clients["НИК-1"], self.source(2))
+        new_info = next(iter(bot.handlers.editor_tracking.values()))
+        self.assertNotEqual(old_info["editor_job_id"], new_info["editor_job_id"])
+        for name in (old_info["expected_pdf_name"], old_info["expected_ai_pdf_name"]):
+            await bot.handlers.handle_editor_response(bot.manager.clients["НИК-2"], self.report(name=name))
+            await bot.handlers.handle_editor_response(
+                bot.manager.clients["НИК-2"], self.report(new_info["reply_to_message_id"], name),
+            )
+        bot.manager.clients["НИК-1"].send_document.assert_not_awaited()
+        self.assertTrue(self.store.editor_report_conflicts("editor", "900", "диплом.pdf", "new"))
+        await bot.handlers.handle_editor_response(bot.manager.clients["НИК-2"], self.report(name=new_info["expected_pdf_name"]))
+        sent = bot.manager.clients["НИК-1"].send_document.await_args.kwargs
+        self.assertEqual("ДИПЛОМ.pdf", sent["file_name"])
+        self.assertEqual(2, sent["reply_to_message_id"])
+        self.assertEqual("done", self.store.get_job(new_info["gateway_job_id"]).status)
+
     async def test_old_plagiscan_response_cannot_select_new_same_name(self):
         old = self.bot()
         self.settings["telegram_group_routes"]["-100123"]["destination"] = "plagiscan"
@@ -141,7 +163,7 @@ class RestartSemanticsTests(unittest.IsolatedAsyncioTestCase):
     async def test_delivered_editor_safety_survives_restart(self):
         old = self.bot()
         await old.handlers.handle_main_account(old.manager.clients["НИК-1"], self.source())
-        await old.handlers.handle_editor_response(old.manager.clients["НИК-2"], self.report())
+        self.store.remember_editor_report("editor", "900", "диплом.pdf", "legacy-task")
         with self.store._connect() as connection:
             before = [tuple(row) for row in connection.execute("SELECT * FROM editor_report_safety WHERE editor!='*'")]
         self.assertTrue(before)
@@ -171,7 +193,7 @@ class RestartSemanticsTests(unittest.IsolatedAsyncioTestCase):
         bot.handlers.outbound_dispatcher.send_result.assert_not_called()
         self.assertEqual({}, bot.manager.processing_files)
         await bot.handlers.handle_main_account(bot.manager.clients["НИК-1"], self.source(2, "Новая.docx"))
-        await bot.handlers.handle_editor_response(bot.manager.clients["НИК-2"], self.report(name="Новая.pdf"))
+        await bot.handlers.handle_editor_response(bot.manager.clients["НИК-2"], self.report(name=next(iter(bot.handlers.editor_tracking.values()))["expected_pdf_name"]))
         bot.manager.clients["НИК-1"].send_document.assert_awaited_once()
         self.assertEqual("abandoned", self.store.get_job(job.job_id).status)
 

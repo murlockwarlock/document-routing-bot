@@ -526,7 +526,7 @@ class TestForcedAuthorRouting(unittest.TestCase):
 
         self.assertEqual(1, editor.send_document.await_count)
         self.assertEqual("@shared-editor", editor.send_document.await_args.kwargs["chat_id"])
-        self.assertEqual("work.docx", editor.send_document.await_args.kwargs["file_name"])
+        self.assertEqual("work__job77.docx", editor.send_document.await_args.kwargs["file_name"])
         handlers.process_anti_file.assert_not_awaited()
         handlers.send_to_24_7_editor.assert_not_awaited()
 
@@ -1178,7 +1178,7 @@ class TestForcedAuthorRouting(unittest.TestCase):
 
         kwargs = editor.send_document.await_args.kwargs
         self.assertEqual("@fixed-editor", kwargs["chat_id"])
-        self.assertEqual("work.docx", kwargs["file_name"])
+        self.assertRegex(kwargs["file_name"], r"^work__job[1-9][0-9]*\.docx$")
         handlers.process_anti_file.assert_not_awaited()
         handlers.send_to_24_7_editor.assert_not_awaited()
         self.assertEqual("@fixed-editor", next(iter(handlers.editor_tracking.values()))["destination"])
@@ -1429,7 +1429,7 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
             id=7001,
             _client=object(),
             reply_to_message_id=None,
-            document=SimpleNamespace(file_name="курсовая работа.pdf"),
+            document=SimpleNamespace(file_name=next(iter(handlers.editor_tracking.values()))["expected_pdf_name"]),
             chat=SimpleNamespace(id=301),
             from_user=SimpleNamespace(username="fixed-editor", id=9000),
             payload=b"normal",
@@ -1438,7 +1438,7 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
             id=7002,
             _client=object(),
             reply_to_message_id=None,
-            document=SimpleNamespace(file_name="ИИ курсовая работа.pdf"),
+            document=SimpleNamespace(file_name=tracking["expected_ai_pdf_name"]),
             chat=SimpleNamespace(id=301),
             from_user=SimpleNamespace(username="fixed-editor", id=9000),
             payload=b"ai",
@@ -1476,7 +1476,7 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
             {"курсовая работа.pdf", "ии курсовая работа.pdf"},
             tracking["delivered_reports"],
         )
-        self.assertIn(tracking_key, handlers.editor_tracking)
+        self.assertNotIn(tracking_key, handlers.editor_tracking)
         self.assertEqual(source_count, handlers.files_today["count"])
         self.assertEqual(
             [],
@@ -1512,7 +1512,7 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
         message = SimpleNamespace(
             id=7003,
             reply_to_message_id=None,
-            document=SimpleNamespace(file_name="курсовая работа.pdf"),
+            document=SimpleNamespace(file_name=next(iter(handlers.editor_tracking.values()))["expected_pdf_name"]),
             chat=SimpleNamespace(id=301),
             from_user=SimpleNamespace(username="fixed-editor", id=9000),
         )

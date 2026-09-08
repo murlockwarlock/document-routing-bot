@@ -2795,6 +2795,9 @@ class BotHandlers:
     @classmethod
     def _editor_tracking_matches_file(cls, doc_name: str, tracking_info: dict) -> bool:
         doc_key = cls._editor_file_key(doc_name)
+        if tracking_info.get("editor_job_id") and "__job" not in doc_name.lower():
+            stem = tracking_info["original_basename"]
+            return doc_key in {cls._editor_file_key(stem + ".pdf"), cls._editor_file_key("ИИ " + stem + ".pdf")}
         return bool(doc_key and doc_key in cls._editor_tracking_keys(tracking_info or {}))
 
     @staticmethod
@@ -2956,6 +2959,74 @@ class BotHandlers:
             score += 10
         return score, -ordinal
 
+    @staticmethod
+    def _editor_job_token(file_name):
+        stem, extension = os.path.splitext(os.path.basename(str(file_name or "")))
+        match = re.search(r"__job([1-9][0-9]*)$", stem)
+        return int(match.group(1)) if match and extension.lower() == ".pdf" else None
+
+    async def _send_human_editor_document(self, client, destination, path, info):
+        original = info.get("original_file_name") or info.get("original_name") or info.get("file_name") or "document.bin"
+        info["original_file_name"] = original
+        if not info.get("editor_job_id"):
+            job_id = info.get("gateway_job_id")
+            info["editor_job_id"] = int(job_id) if isinstance(job_id, (int, str)) and str(job_id).isdigit() and int(job_id) > 0 else uuid.uuid4().int
+        stem, extension = os.path.splitext(os.path.basename(original))
+        info["transport_file_name"] = f"{stem}__job{info['editor_job_id']}{extension}"
+        return await client.send_document(chat_id=destination, document=path, file_name=info["transport_file_name"])
+
+    @staticmethod
+    def _attach_editor_assignment(tracking, source):
+        tracking.update(
+            file_uid=source.get("file_uid"),
+            editor_job_id=source["editor_job_id"],
+            transport_file_name=source["transport_file_name"],
+            original_file_name=source["original_file_name"],
+            original_basename=os.path.splitext(os.path.basename(source["original_file_name"]))[0],
+            expected_pdf_name=os.path.splitext(source["transport_file_name"])[0] + ".pdf",
+            expected_ai_pdf_name="ИИ " + os.path.splitext(source["transport_file_name"])[0] + ".pdf",
+            delivered_reports=set(), normal_report_delivered=False, ai_report_delivered=False,
+            first_report_at=None, lifecycle="waiting_first_report", account_released=True,
+        )
+
+    def _expire_editor_assignments(self, now=None):
+        now = now or datetime.now()
+        for key, info in list(self.editor_tracking.items()):
+            first_report_at = info.get("first_report_at")
+            if info.get("editor_job_id") and first_report_at and now >= first_report_at + timedelta(minutes=30):
+                info["lifecycle"] = "closed"
+                self.editor_tracking.pop(key, None)
+
+    def _find_token_editor_assignment(self, sender, file_name, account, chat_id, reply_id=None):
+        self._expire_editor_assignments()
+        job_id = self._editor_job_token(file_name)
+        if job_id is None:
+            return None, None, "malformed editor job token"
+        matches = [(key, info) for key, info in self.editor_tracking.items()
+                   if info.get("editor_job_id") == job_id and info.get("sent_from_account") == account]
+        if len(matches) != 1:
+            return None, None, f"unknown, expired or ambiguous editor job {job_id}"
+        key, info = matches[0]
+        if self._normalize_editor_destination(sender) != self._normalize_editor_destination(info.get("destination")):
+            return None, None, "editor job sender mismatch"
+        if info.get("chat_id") is not None and str(info["chat_id"]) != str(chat_id):
+            return None, None, "editor job chat mismatch"
+        if reply_id is not None and reply_id != info.get("reply_to_message_id"):
+            return None, None, "editor job token/reply conflict"
+        expected = {self._editor_report_key(info["expected_pdf_name"]), self._editor_report_key(info["expected_ai_pdf_name"])}
+        if self._editor_report_key(file_name) not in expected:
+            return None, None, "editor job report name mismatch"
+        return key, info, f"exact editor job {job_id}"
+
+    def _editor_client_report_name(self, info, incoming_name):
+        if not info.get("editor_job_id"):
+            return incoming_name
+        original = info["original_basename"]
+        ai = self._editor_report_key(incoming_name) in {
+            self._editor_report_key(info["expected_ai_pdf_name"]), self._editor_report_key(f"ИИ {original}.pdf"),
+        }
+        return ("ИИ " if ai else "") + original + ".pdf"
+
     def _editor_safety_context(self, info, file_name):
         editor = self._normalize_editor_destination(info.get("destination"))
         chat_id = info.get("chat_id")
@@ -2978,11 +3049,14 @@ class BotHandlers:
         sent_from_account: str = "НИК-2",
         reply_chat_id=None,
     ):
+        self._expire_editor_assignments()
+        if "__job" in str(doc_name).lower():
+            return self._find_token_editor_assignment(sender, doc_name, sent_from_account, reply_chat_id)
         sender_clean = str(sender or "").replace("@", "").lower()
         candidates = [
             (key, info)
             for key, info in self.editor_tracking.items()
-            if info.get("sent_from_account") == sent_from_account
+            if not info.get("editor_job_id") and info.get("sent_from_account") == sent_from_account
             and str(info.get("destination", "")).replace("@", "").lower() == sender_clean
             and (
                 reply_chat_id is None
@@ -3401,7 +3475,7 @@ class BotHandlers:
 
         def cleanup_task():
             while True:
-                time.sleep(3600)  # Проверяем каждый час
+                time.sleep(60)
                 self.cleanup_old_editor_tracking()
 
         # Запускаем в отдельном потоке
@@ -3706,10 +3780,13 @@ class BotHandlers:
 
         current_time = datetime.now()
         self._cleanup_editor_response_state(current_time)
+        self._expire_editor_assignments(current_time)
         to_remove = []
 
         for msg_id, tracking_info in self.editor_tracking.items():
             sent_at = tracking_info.get("sent_at")
+            if tracking_info.get("editor_job_id") and tracking_info.get("first_report_at"):
+                continue
             if isinstance(sent_at, datetime) and current_time - sent_at > timedelta(hours=24):
                 to_remove.append(msg_id)
 
@@ -4015,6 +4092,11 @@ class BotHandlers:
 
         author = message.from_user.username or str(message.from_user.id) if message.from_user else "unknown"
         print(f"\n📨 Новое сообщение от {author}")
+
+        if (str(message.document.file_name or "").lower().endswith(".pdf")
+                and "__job" in message.document.file_name.lower() and not self.is_bot_message(author)):
+            await self.handle_editor_response(client, message)
+            return
 
         # Сначала проверяем, является ли это ответом на ожидаемое сообщение
         if message.reply_to_message_id:
@@ -4334,11 +4416,7 @@ class BotHandlers:
                 print(f"   Причина: {file_info['reason']}")
 
             # ОТПРАВЛЯЕМ БЕЗ CAPTION
-            sent_msg = await client.send_document(
-                chat_id=editor_24_7,
-                document=temp_path,
-                file_name=file_name,
-            )
+            sent_msg = await self._send_human_editor_document(client, editor_24_7, temp_path, working_info)
             print(f"✅ Файл отправлен редактору {editor_24_7} через {account_name}")
             self._log_editor(f"✅ Файл отправлен редактору {editor_24_7} через {account_name} | file={file_name} msg_id={sent_msg.id}")
 
@@ -4376,6 +4454,7 @@ class BotHandlers:
                 "force_plagiscan": file_info.get("force_plagiscan", False) if file_info else False,
                 "via_normal_destination": file_info.get("via_normal_destination", False) if file_info else False,
             }
+            self._attach_editor_assignment(self.editor_tracking[tracking_key], working_info)
             if file_info:
                 await self._mark_gateway_job_waiting_editor(file_info, "waiting_editor247_response")
 
@@ -4632,11 +4711,7 @@ class BotHandlers:
                 print(f"📤 Отправляем анти-файл редактору через НИК-2: {destination}")
 
                 original_name = file_info.get("original_file_name", file_info["file_name"])
-                sent_msg = await client_nik2.send_document(
-                    chat_id=destination,
-                    document=temp_path,
-                    file_name=original_name
-                )
+                sent_msg = await self._send_human_editor_document(client_nik2, destination, temp_path, file_info)
 
                 original_name_without_ext = os.path.splitext(original_name)[0]
 
@@ -4668,14 +4743,13 @@ class BotHandlers:
                     "force_plagiscan": file_info.get("force_plagiscan", False),
                     "via_normal_destination": file_info.get("via_normal_destination", False),
                 }
+                self._attach_editor_assignment(self.editor_tracking[tracking_key], file_info)
                 await self._mark_gateway_job_waiting_editor(file_info, "waiting_anti_editor_response")
 
                 print(f"✅ Анти-файл отправлен редактору {destination} через НИК-2. ID сообщения: {sent_msg.id}")
                 print(f"📝 Ожидаю PDF файл: {original_name_without_ext}.pdf от редактора в НИК-2")
                 self._log_editor(f"✅ Анти-файл отправлен редактору {destination} через НИК-2. ID сообщения: {sent_msg.id}")
                 self._log_editor(f"📝 Ожидаю PDF файл: {original_name_without_ext}.pdf от редактора в НИК-2")
-
-                self.manager.mark_account_busy("НИК-2", file_info["file_name"])
 
             else:
                 self.current_processing_files[file_key] = {
@@ -5025,11 +5099,7 @@ class BotHandlers:
                     else:
                         print(f"📤 Отправляем файл редактору рабочего времени через НИК-2: {destination}")
                         self._log_editor(f"📤 Отправляем файл редактору рабочего времени через НИК-2: {destination} | file={file_info.get('original_file_name', file_info['file_name'])}")
-                    sent_msg = await client_nik2.send_document(
-                        chat_id=destination,
-                        document=temp_path,
-                        file_name=file_info.get("original_file_name", file_info["file_name"])
-                    )
+                    sent_msg = await self._send_human_editor_document(client_nik2, destination, temp_path, file_info)
 
                     original_name = file_info.get("original_file_name", file_info["file_name"])
                     original_name_without_ext = os.path.splitext(original_name)[0]
@@ -5061,6 +5131,7 @@ class BotHandlers:
                         "force_plagiscan": file_info.get("force_plagiscan", False),
                         "via_normal_destination": file_info.get("via_normal_destination", False),
                     }
+                    self._attach_editor_assignment(self.editor_tracking[tracking_key], file_info)
                     await self._mark_gateway_job_waiting_editor(
                         file_info,
                         "waiting_editor247_response" if use_24_7_editor else "waiting_editor_response_mode2_working_hours",
@@ -5092,11 +5163,7 @@ class BotHandlers:
                         print(f"📤 Отправляем файл редактору через НИК-2: {destination}")
                         self._log_editor(f"📤 Отправляем файл редактору через НИК-2: {destination} | file={file_info.get('original_file_name', file_info['file_name'])}")
 
-                    sent_msg = await client_nik2.send_document(
-                        chat_id=destination,
-                        document=temp_path,
-                        file_name=file_info.get("original_file_name", file_info["file_name"])
-                    )
+                    sent_msg = await self._send_human_editor_document(client_nik2, destination, temp_path, file_info)
 
                     original_name = file_info.get("original_file_name", file_info["file_name"])
                     original_name_without_ext = os.path.splitext(original_name)[0]
@@ -5140,6 +5207,7 @@ class BotHandlers:
                                 "account_released": False,
                             }
                         )
+                    self._attach_editor_assignment(self.editor_tracking[tracking_key], file_info)
                     await self._mark_gateway_job_waiting_editor(
                         file_info,
                         "waiting_editor247_response" if route_to_24_7 else "waiting_editor_response",
@@ -5171,8 +5239,20 @@ class BotHandlers:
             effective_reply_id = resolved_reply_to_message_id or getattr(message, "reply_to_message_id", None)
             message_chat_id = getattr(getattr(message, "chat", None), "id", None)
             tracking_key = None
-            # Проверяем, что это сообщение от НИК-2
-            if client.name != "НИК-2":
+            self._expire_editor_assignments()
+            incoming_name = getattr(getattr(message, "document", None), "file_name", "") or ""
+            token_response = "__job" in incoming_name.lower()
+            if token_response:
+                sender = message.from_user.username or str(message.from_user.id) if getattr(message, "from_user", None) else ""
+                tracking_key, tracking_info, reason = self._find_token_editor_assignment(
+                    sender, incoming_name, client.name, message_chat_id, getattr(message, "reply_to_message_id", None),
+                )
+                if tracking_info is None:
+                    self._log_editor(f"Editor correlation stopped: {reason}")
+                    print(f"Editor correlation stopped: {reason}")
+                    return
+                effective_reply_id = tracking_info.get("reply_to_message_id")
+            elif client.name != "НИК-2":
                 # Если это не НИК-2, проверяем стандартное отслеживание
                 tracking_info = self.editor_tracking.get(effective_reply_id)
                 if tracking_info:
@@ -5321,15 +5401,17 @@ class BotHandlers:
                     )
                     return
 
-            if tracking_info.get("fixed_author_editor_route"):
+            multi_report = bool(tracking_info.get("fixed_author_editor_route") or tracking_info.get("editor_job_id"))
+            deliver_file_name = self._editor_client_report_name(tracking_info, file_name)
+            if multi_report:
                 delivered_reports = tracking_info.setdefault("delivered_reports", set())
-                report_key = self._editor_report_key(file_name)
+                report_key = self._editor_report_key(deliver_file_name)
                 if report_key in delivered_reports:
                     print(f"⏭️  PDF редактора уже доставлен: {file_name}")
                     self._log_editor(f"⏭️ PDF редактора уже доставлен повторно: {file_name}")
                     return
 
-            if tracking_info.get("fixed_author_editor_route"):
+            if tracking_info.get("fixed_author_editor_route") and not tracking_info.get("editor_job_id"):
                 report_names = {
                     file_name, tracking_info.get("expected_pdf_name"), tracking_info.get("expected_ai_pdf_name"),
                 }
@@ -5342,8 +5424,6 @@ class BotHandlers:
             if not claimed:
                 return
 
-            # Редакторский PDF отправляем с тем именем, которое вернул редактор.
-            deliver_file_name = file_name
             delivery_accepted = False
 
             # Если это ответ в НИК-2, нужно отправить файл автору через НИК-1
@@ -5458,22 +5538,30 @@ class BotHandlers:
             if not delivery_accepted:
                 self._release_editor_response_claim(response_claim_key)
 
-            if tracking_info.get("fixed_author_editor_route") and delivery_accepted:
-                tracking_info.setdefault("delivered_reports", set()).add(self._editor_report_key(file_name))
+            if multi_report and delivery_accepted:
+                tracking_info.setdefault("delivered_reports", set()).add(self._editor_report_key(deliver_file_name))
+                if tracking_info.get("editor_job_id"):
+                    tracking_info["first_report_at"] = tracking_info.get("first_report_at") or datetime.now()
+                    ai_report = deliver_file_name == "ИИ " + tracking_info["original_basename"] + ".pdf"
+                    tracking_info["ai_report_delivered" if ai_report else "normal_report_delivered"] = True
+                    tracking_info["lifecycle"] = "waiting_second_report"
+                    if tracking_info["normal_report_delivered"] and tracking_info["ai_report_delivered"]:
+                        tracking_info["lifecycle"] = "closed"
+                        self.editor_tracking.pop(tracking_key, None)
 
             # Удаляем из отслеживания
-            if delivery_accepted and not tracking_info.get("fixed_author_editor_route") and client.name == "НИК-2":
+            if delivery_accepted and not multi_report and client.name == "НИК-2":
                 # Удаляем по специальному ключу
                 if tracking_key in self.editor_tracking:
                     del self.editor_tracking[tracking_key]
                     print(f"🗑️  Удален из отслеживания: {tracking_key}")
-            elif delivery_accepted and not tracking_info.get("fixed_author_editor_route") and effective_reply_id in self.editor_tracking:
+            elif delivery_accepted and not multi_report and effective_reply_id in self.editor_tracking:
                 del self.editor_tracking[effective_reply_id]
                 print(f"🗑️  Удален из отслеживания: {effective_reply_id}")
 
             # Освобождаем аккаунт НИК-2 если он был занят
             if tracking_info.get('sent_from_account') == "НИК-2":
-                if not tracking_info.get("fixed_author_editor_route") or not tracking_info.get("account_released"):
+                if not multi_report or not tracking_info.get("account_released"):
                     anti_file_name = tracking_info.get('original_name', '')
                     self.manager.mark_account_free("НИК-2", anti_file_name)
                     tracking_info["account_released"] = True
@@ -5489,8 +5577,8 @@ class BotHandlers:
             # Обновляем отслеживание
             author = tracking_info["author"]
             if delivery_accepted and author in self.file_tracking:
-                if file_name not in self.file_tracking[author]["received"]:
-                    self.file_tracking[author]["received"].append(file_name)
+                if deliver_file_name not in self.file_tracking[author]["received"]:
+                    self.file_tracking[author]["received"].append(deliver_file_name)
 
                 # Удаляем из ожидающих
                 if tracking_info["original_name"] in self.file_tracking[author]["pending"]:
@@ -6414,10 +6502,8 @@ class BotHandlers:
             self._log_editor(f"📤 Ошибка AAA → скачиваем и отправляем через НИК-2 редактору: {editor_nickname} | file={processing_info.get('original_file_name', 'document.docx')}")
 
             # Метод download + send_document гарантирует скрытие данных отправителя (автора)
-            sent_msg = await client_nik2.send_document(
-                chat_id=editor_nickname,
-                document=original_file_path,
-                file_name=processing_info.get("original_file_name", "document.docx")
+            sent_msg = await self._send_human_editor_document(
+                client_nik2, editor_nickname, original_file_path, processing_info
             )
 
             original_name = processing_info.get("original_file_name", "unknown")
@@ -6445,6 +6531,7 @@ class BotHandlers:
                 "route_is_group": processing_info.get("route_is_group", False),
                 "gateway_job_id": processing_info.get("gateway_job_id"),
             }
+            self._attach_editor_assignment(self.editor_tracking[tracking_key], processing_info)
             await self._mark_gateway_job_waiting_editor(processing_info, "waiting_editor_response_after_aaa_error")
 
             print(f"✅ Файл отправлен редактору через НИК-2. Ожидаю: {original_name_without_ext}.pdf")
