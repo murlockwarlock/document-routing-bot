@@ -33,7 +33,7 @@ class Config:
     DEFAULT_SETTINGS = {
         "mode": "mode1",
         "allowed_authors": [],  # Список авторов, от которых принимаем файлы
-        "normal_destination": "бот",
+        "normal_destination": "плагискан",
         "anti_destination": "бот",
         "anti_bot": "@plagaiscan_bot",
         "plagiscan_users": [],
@@ -231,6 +231,21 @@ class Config:
         return nickname or None
 
     @classmethod
+    def _normalize_normal_destination(cls, value, settings=None):
+        destination = str(value or "плагискан").strip().lower()
+        if destination in {"редактор", "editor"}:
+            return "редактор"
+        if destination in {"плагискан", "plagiscan"}:
+            return "плагискан"
+        if destination in {"бот", "bot"}:
+            settings = settings if isinstance(settings, dict) else cls._SETTINGS
+            editor = cls._normalize_nickname(
+                settings.get("normal_editor_nickname") or settings.get("editor_nickname")
+            )
+            return "редактор" if editor else "плагискан"
+        return "плагискан"
+
+    @classmethod
     def _legacy_shared_route(cls, legacy_routes, forced_authors=None):
         if not isinstance(legacy_routes, dict) or not legacy_routes:
             return "plagiscan", None
@@ -299,6 +314,15 @@ class Config:
     @classmethod
     def _normalize_settings(cls, *, has_forced_authors_destination=True, legacy_author_routes=None):
         settings = cls._SETTINGS
+        raw_normal_destination = settings.get("normal_destination")
+        normal_editor = cls._normalize_nickname(settings.get("normal_editor_nickname"))
+        if normal_editor:
+            settings["normal_editor_nickname"] = normal_editor
+        if str(raw_normal_destination or "").strip().lower() in {"бот", "bot"} and not normal_editor:
+            legacy_editor = cls._normalize_nickname(settings.get("editor_nickname"))
+            if legacy_editor:
+                settings["normal_editor_nickname"] = legacy_editor
+        settings["normal_destination"] = cls._normalize_normal_destination(raw_normal_destination, settings)
         forced_destination = str(settings.get("forced_authors_destination") or "plagiscan").strip().lower()
         if not has_forced_authors_destination:
             forced_destination, legacy_editor = cls._legacy_shared_route(
@@ -474,19 +498,15 @@ class Config:
         print("📄 НАСТРОЙКА ОБЫЧНЫХ ФАЙЛОВ")
         print("-" * 30)
 
-        current_normal_dest = settings.get("normal_destination", "бот")
+        current_normal_dest = settings.get("normal_destination", "плагискан")
         print(f"\nКуда отправлять обычные файлы?")
-        print("1. В AI бота")
-        print("2. Напрямую редактору")
-        print("3. В бота @plagaiscan_bot")
+        print("1. Напрямую редактору")
+        print("2. В бота @plagaiscan_bot")
         print(f"Текущая настройка: {current_normal_dest}")
 
         while True:
-            normal_choice = input("Выберите (1-3) [Enter чтобы оставить текущий]: ").strip()
+            normal_choice = input("Выберите (1-2) [Enter чтобы оставить текущий]: ").strip()
             if normal_choice == '1':
-                Config.update_setting("normal_destination", "бот")
-                break
-            elif normal_choice == '2':
                 Config.update_setting("normal_destination", "редактор")
                 current_editor = settings.get("normal_editor_nickname") or settings.get("editor_nickname", "")
                 editor = input(f"Никнейм редактора для обычных файлов (например, @username) [Enter: {current_editor}]: ").strip()
@@ -497,7 +517,7 @@ class Config:
                     editor = current_editor
                 Config.update_setting("normal_editor_nickname", editor)
                 break
-            elif normal_choice == '3':
+            elif normal_choice == '2':
                 Config.update_setting("normal_destination", "плагискан")
                 current_bot = settings.get("anti_bot", "@plagaiscan_bot")
                 custom_bot = input(f"Имя Plagiscan бота [Enter: {current_bot}]: ").strip()
@@ -507,15 +527,6 @@ class Config:
                 break
             else:
                 print("❌ Неверный выбор")
-
-        # Настройка AI бота
-        print("\n" + "-" * 30)
-        print("🤖 НАСТРОЙКА AI БОТА")
-        print("-" * 30)
-
-        current_ai_bot = settings.get("ai_bot", "@AAA_Report_AIBot")
-        ai_bot = input(f"Имя AI бота [Enter: {current_ai_bot}]: ").strip()
-        Config.update_setting("ai_bot", ai_bot if ai_bot else current_ai_bot)
 
         Config.setup_forced_authors_interactive()
 
@@ -889,10 +900,9 @@ class Config:
         else:
             print("Разрешенные авторы: все авторы")
 
-        print(f"Обычные файлы: → {settings.get('normal_destination', 'бот')}")
-        if settings.get('normal_destination') == 'бот':
-            print(f"  AI бот: {settings.get('ai_bot', '@AAA_Report_AIBot')}")
-        elif settings.get('normal_destination') == 'плагискан':
+        normal_destination = Config._normalize_normal_destination(settings.get("normal_destination"), settings)
+        print(f"Обычные файлы: → {normal_destination}")
+        if normal_destination == 'плагискан':
             print(f"  Plagiscan бот: {settings.get('anti_bot', '@plagaiscan_bot')}")
         else:
             normal_editor = settings.get('normal_editor_nickname') or settings.get('editor_nickname', 'не задан')

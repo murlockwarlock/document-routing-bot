@@ -99,6 +99,7 @@ def telegram_file_info(author, author_id, file_name, *, chat_id=None, message_id
 class TestForcedAuthorRouting(unittest.TestCase):
     def test_active_defaults_contain_only_first_two_accounts(self):
         self.assertEqual(["НИК-1", "НИК-2"], list(Config.DEFAULT_ACCOUNTS))
+        self.assertEqual("плагискан", Config.DEFAULT_SETTINGS["normal_destination"])
 
     def test_legacy_accounts_are_loaded_but_not_kept_active_or_saved(self):
         old_accounts = Config._ACCOUNTS
@@ -135,6 +136,118 @@ class TestForcedAuthorRouting(unittest.TestCase):
                     self.assertEqual({"НИК-1", "НИК-2"}, set(saved["accounts"]))
         finally:
             Config._ACCOUNTS = old_accounts
+            Config._SETTINGS = old_settings
+
+    def test_legacy_aaa_normal_destination_migrates_to_existing_editor(self):
+        old_accounts = Config._ACCOUNTS
+        old_settings = Config._SETTINGS
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.json"
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "accounts": {},
+                            "settings": {
+                                "normal_destination": "бот",
+                                "normal_editor_nickname": "legacy-editor",
+                                "normal_accounts": ["НИК-3"],
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                with patch.object(Config, "CONFIG_FILE", config_path):
+                    Config.load_config()
+                    Config.save_config()
+
+                self.assertEqual("редактор", Config.get_setting("normal_destination"))
+                self.assertEqual("@legacy-editor", Config.get_setting("normal_editor_nickname"))
+                self.assertEqual([], Config.get_setting("normal_accounts"))
+                saved = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertEqual("редактор", saved["settings"]["normal_destination"])
+                self.assertEqual([], saved["settings"]["normal_accounts"])
+        finally:
+            Config._ACCOUNTS = old_accounts
+            Config._SETTINGS = old_settings
+
+    def test_legacy_aaa_normal_destination_migrates_to_plagiscan_without_editor(self):
+        old_accounts = Config._ACCOUNTS
+        old_settings = Config._SETTINGS
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.json"
+                config_path.write_text(
+                    json.dumps(
+                        {
+                            "accounts": {},
+                            "settings": {"normal_destination": "бот"},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                with patch.object(Config, "CONFIG_FILE", config_path):
+                    Config.load_config()
+                    Config.save_config()
+
+                self.assertEqual("плагискан", Config.get_setting("normal_destination"))
+                saved = json.loads(config_path.read_text(encoding="utf-8"))
+                self.assertEqual("плагискан", saved["settings"]["normal_destination"])
+        finally:
+            Config._ACCOUNTS = old_accounts
+            Config._SETTINGS = old_settings
+
+    def test_common_settings_menu_does_not_offer_aaa_route(self):
+        old_settings = Config._SETTINGS
+        try:
+            Config._SETTINGS = {
+                **Config.DEFAULT_SETTINGS,
+                "normal_destination": "плагискан",
+                "anti_destination": "бот",
+                "max_concurrent": 7,
+            }
+            with patch.object(Config, "load_config"), patch.object(Config, "save_config"), patch.object(
+                Config, "show_current_settings"
+            ), patch.object(Config, "setup_forced_authors_interactive"), patch(
+                "builtins.input", side_effect=["", "", "", ""]
+            ), patch("builtins.print") as print_mock:
+                Config.setup_editors_interactive()
+
+            output = " ".join(str(item) for item in print_mock.call_args_list)
+            self.assertNotIn("AAA", output)
+            self.assertNotIn("AI бота", output)
+            self.assertIn("Напрямую редактору", output)
+            self.assertIn("В бота @plagaiscan_bot", output)
+        finally:
+            Config._SETTINGS = old_settings
+
+    def test_launch_menu_does_not_offer_aaa_route(self):
+        from main import ConsoleMenu
+
+        old_settings = Config._SETTINGS
+        try:
+            Config._SETTINGS = {
+                **Config.DEFAULT_SETTINGS,
+                "mode": "mode2",
+                "normal_destination": "плагискан",
+                "anti_destination": "бот",
+                "editor_nickname": "@editor",
+                "editor_24_7": "@editor-247",
+            }
+            with patch.object(Config, "load_config"), patch.object(Config, "save_config"), patch.object(
+                ConsoleMenu, "setup_editor_24_7"
+            ), patch(
+                "builtins.input", side_effect=["", "", "", "", "", "", "", "", ""]
+            ), patch("builtins.print") as print_mock:
+                self.assertTrue(ConsoleMenu.setup_before_launch(force_mode="mode2", launch_prompt="continue"))
+
+            output = " ".join(str(item) for item in print_mock.call_args_list)
+            self.assertNotIn("AAA", output)
+            self.assertIn("Редактор", output)
+            self.assertIn("Плагискан", output)
+        finally:
             Config._SETTINGS = old_settings
 
     def test_account_menu_prompts_only_for_the_two_active_accounts(self):
@@ -185,6 +298,7 @@ class TestForcedAuthorRouting(unittest.TestCase):
             self.assertIn("Принудительные авторы", output)
             self.assertIn("редактор @editor", output)
             self.assertIn("Компания → Plagiscan", output)
+            self.assertNotIn("AAA", output)
             self.assertNotIn("legacy-account", output)
             for stale_name in ("НИК-3", "НИК-4", "НИК-5", "НИК-6", "НИК-7"):
                 self.assertNotIn(stale_name, output)

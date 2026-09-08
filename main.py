@@ -304,21 +304,14 @@ class ConsoleMenu:
 
             # Маршрут обычных файлов в рабочее время
             print("\n📄 КУДА ОТПРАВЛЯТЬ ОБЫЧНЫЕ ФАЙЛЫ В РАБОЧЕЕ ВРЕМЯ?")
-            print("1. Бот AAA")
-            print("2. Редактор")
-            print("3. Плагискан")
-            current_normal_dest = Config.get_setting("normal_destination", "бот")
+            print("1. Редактор")
+            print("2. Плагискан")
+            current_normal_dest = Config.get_setting("normal_destination", "плагискан")
             print(f"Текущая настройка: {current_normal_dest}")
 
             while True:
-                normal_choice = input("Выберите (1-3) [Enter оставить текущую]: ").strip()
+                normal_choice = input("Выберите (1-2) [Enter оставить текущую]: ").strip()
                 if normal_choice == '1':
-                    Config.update_setting("normal_destination", "бот")
-                    current_ai_bot = Config.get_setting("ai_bot", "@AAA_Report_AIBot")
-                    ai_bot = input(f"Имя AAA бота [Enter: {current_ai_bot}]: ").strip()
-                    Config.update_setting("ai_bot", ai_bot if ai_bot else current_ai_bot)
-                    break
-                elif normal_choice == '2':
                     Config.update_setting("normal_destination", "редактор")
                     if not Config.get_setting("editor_nickname"):
                         editor = input("Никнейм редактора для рабочего времени: ").strip()
@@ -326,7 +319,7 @@ class ConsoleMenu:
                             editor = '@' + editor
                         Config.update_setting("editor_nickname", editor or None)
                     break
-                elif normal_choice == '3':
+                elif normal_choice == '2':
                     Config.update_setting("normal_destination", "плагискан")
                     current_bot = Config.get_setting("anti_bot", "@plagaiscan_bot")
                     custom_bot = input(f"Имя Plagiscan бота [Enter: {current_bot}]: ").strip()
@@ -608,10 +601,11 @@ class ConsoleMenu:
             work_editor = final_settings.get('editor_nickname')
             work_editor_display = work_editor if isinstance(work_editor, str) and work_editor.startswith('@') else None
             print(f"Редактор рабочего времени: {work_editor_display or 'не задан'}")
-            print(f"Обычные файлы в рабочее время: {final_settings.get('normal_destination', 'бот')}")
-            if final_settings.get('normal_destination') == "бот":
-                print(f"  AAA бот: {final_settings.get('ai_bot', '@AAA_Report_AIBot')}")
-            elif final_settings.get('normal_destination') == "плагискан":
+            normal_destination = Config._normalize_normal_destination(
+                final_settings.get("normal_destination"), final_settings
+            )
+            print(f"Обычные файлы в рабочее время: {normal_destination}")
+            if normal_destination == "плагискан":
                 print(f"  Plagiscan бот: {final_settings.get('anti_bot', '@plagaiscan_bot')}")
             print(f"Анти-файлы в рабочее время: {final_settings.get('anti_destination', 'бот')}")
             if final_settings.get('anti_destination') == "бот":
