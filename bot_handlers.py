@@ -2856,7 +2856,7 @@ class BotHandlers:
         delivered_reports = tracking_info.get("delivered_reports") or set()
         return self._editor_report_key(file_name) not in delivered_reports
 
-    def _editor_tracking_is_recently_completed(self, tracking_info: dict, now=None) -> bool:
+    def _editor_tracking_is_recently_completed(self, tracking_info: dict, report_name=None, now=None) -> bool:
         if not tracking_info.get("fixed_author_editor_route"):
             return False
         sent_at = tracking_info.get("sent_at")
@@ -2882,6 +2882,8 @@ class BotHandlers:
             for name in (tracking_info.get("delivered_reports") or set())
             if name
         }
+        if report_name:
+            return self._editor_report_key(report_name) in delivered_reports
         return bool(expected_reports) and expected_reports.issubset(delivered_reports)
 
     def _find_editor_tracking_by_reply(self, reply_to_message_id, chat_id=None, sent_from_account="НИК-2"):
@@ -2986,7 +2988,7 @@ class BotHandlers:
                 info
                 for key, info in self.editor_tracking.items()
                 if key != matched_key
-                and self._editor_tracking_is_recently_completed(info)
+                and self._editor_tracking_is_recently_completed(info, doc_name)
                 and info.get("sent_from_account") == sent_from_account
                 and str(info.get("destination", "")).replace("@", "").lower() == sender_clean
                 and (
@@ -3965,6 +3967,7 @@ class BotHandlers:
             if tracking_info or message.reply_to_message_id in self.editor_tracking:
                 print(f"✅ Получен ожидаемый ответ от редактора {author}")
                 await self.handle_editor_response(client, message)
+                return
             elif getattr(client, "name", None) == "НИК-2":
                 if message.document and message.document.file_name.lower().endswith(".pdf"):
                     self._warn_unknown_editor_response(message, message.reply_to_message_id)

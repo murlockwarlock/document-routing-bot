@@ -3518,6 +3518,46 @@ class TestEditorResponseOriginalFilename(unittest.IsolatedAsyncioTestCase):
 
         handlers.handle_editor_response.assert_awaited_once_with(client, msg)
 
+    async def test_main_account_known_editor_document_reply_stops_inbound_flow(self):
+        handlers = _make_handlers()
+        handlers.handle_editor_response = AsyncMock()
+        handlers.is_bot_message = MagicMock(return_value=False)
+        handlers.is_author_allowed = MagicMock(return_value=True)
+        handlers.manager.get_file_lock = AsyncMock(return_value=asyncio.Lock())
+        handlers.manager.get_file_status = AsyncMock(return_value="NEW")
+        handlers.manager.set_file_status = AsyncMock()
+        handlers.manager.reset_waiting_status = MagicMock()
+        handlers.process_queue = AsyncMock()
+        handlers.editor_tracking["no_checks_705"] = {
+            "sent_from_account": "НИК-2",
+            "reply_to_message_id": 705,
+            "chat_id": 301,
+            "destination": "@Xlistyara",
+            "original_name": "325451 анти.docx",
+            "expected_pdf_name": "325451 анти.pdf",
+            "file_uid": "telegram:806750628:13023:0",
+        }
+        msg = SimpleNamespace(
+            id=706,
+            document=SimpleNamespace(file_name="325451 анти.pdf", file_size=256),
+            text=None,
+            reply_to_message_id=705,
+            chat=SimpleNamespace(id=301, type="private"),
+            from_user=SimpleNamespace(username="Xlistyara", id=806750628),
+        )
+        ingest_job = SimpleNamespace(
+            job_id=80,
+            file_path=__file__,
+            dedupe_key="telegram:301:706:0",
+        )
+
+        with patch("bot_handlers.ingest_pyrogram_message", new=AsyncMock(return_value=[ingest_job])) as ingest_mock:
+            await handlers.handle_main_account(SimpleNamespace(name="НИК-1"), msg)
+
+        handlers.handle_editor_response.assert_awaited_once_with(SimpleNamespace(name="НИК-1"), msg)
+        ingest_mock.assert_not_awaited()
+        self.assertEqual([], handlers.manager.file_queue)
+
     async def test_main_account_text_from_editor_without_reply_uses_single_pending_tracking(self):
         handlers = _make_handlers()
         handlers.handle_editor_response = AsyncMock()

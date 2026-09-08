@@ -1671,6 +1671,78 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(1, len(warnings))
 
+    @staticmethod
+    def _same_named_fixed_tracking(old_delivered_reports):
+        return {
+            "fixed_editor_301_300329": {
+                "original_name": "ДИПЛОМ.docx",
+                "expected_pdf_name": "ДИПЛОМ.pdf",
+                "expected_ai_pdf_name": "ИИ ДИПЛОМ.pdf",
+                "destination": "@fixed-editor",
+                "sent_from_account": "НИК-2",
+                "reply_to_message_id": 300329,
+                "chat_id": 301,
+                "fixed_author_editor_route": True,
+                "delivered_reports": set(old_delivered_reports),
+                "sent_at": datetime.now(),
+            },
+            "fixed_editor_301_300330": {
+                "original_name": "ДИПЛОМ.docx",
+                "expected_pdf_name": "ДИПЛОМ.pdf",
+                "expected_ai_pdf_name": "ИИ ДИПЛОМ.pdf",
+                "destination": "@fixed-editor",
+                "sent_from_account": "НИК-2",
+                "reply_to_message_id": 300330,
+                "chat_id": 301,
+                "fixed_author_editor_route": True,
+                "delivered_reports": set(),
+                "sent_at": datetime.now(),
+            },
+        }
+
+    async def _assert_single_report_history_blocks_filename_fallback(self, old_report, incoming_name):
+        handlers = make_handlers()
+        handlers.editor_tracking = self._same_named_fixed_tracking({old_report})
+
+        key, info, reason = handlers.find_editor_tracking_for_unreplied_pdf(
+            "fixed-editor",
+            incoming_name,
+            reply_chat_id=301,
+        )
+
+        self.assertIsNone(key)
+        self.assertIsNone(info)
+        self.assertIn("неоднозначное", reason)
+
+        handlers._deliver_document_to_origin = AsyncMock()
+        message = SimpleNamespace(
+            id=7008,
+            reply_to_message_id=None,
+            document=SimpleNamespace(file_name=incoming_name),
+            chat=SimpleNamespace(id=301),
+            from_user=SimpleNamespace(username="fixed-editor", id=9000),
+        )
+        with patch("builtins.print"):
+            await handlers.handle_editor_response(SimpleNamespace(name="НИК-2"), message)
+
+        handlers._deliver_document_to_origin.assert_not_awaited()
+        self.assertIn("fixed_editor_301_300330", handlers.editor_tracking)
+
+    async def test_recent_normal_only_report_blocks_same_name_filename_fallback(self):
+        await self._assert_single_report_history_blocks_filename_fallback("диплом.pdf", "ДИПЛОМ.pdf")
+
+    async def test_recent_ai_only_report_blocks_same_name_filename_fallback(self):
+        await self._assert_single_report_history_blocks_filename_fallback("ии диплом.pdf", "ИИ ДИПЛОМ.pdf")
+
+    async def test_explicit_reply_selects_active_task_after_single_old_report(self):
+        handlers = make_handlers()
+        handlers.editor_tracking = self._same_named_fixed_tracking({"диплом.pdf"})
+
+        key, info = handlers._find_editor_tracking_by_reply(300330, chat_id=301)
+
+        self.assertEqual("fixed_editor_301_300330", key)
+        self.assertEqual(300330, info["reply_to_message_id"])
+
     async def test_completed_fixed_task_is_not_a_filename_candidate_for_next_same_named_task(self):
         handlers = make_handlers()
         handlers.editor_tracking = {
