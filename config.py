@@ -811,12 +811,15 @@ class Config:
         routes = deepcopy(cls.get_setting("telegram_group_routes", {}) or {})
         if not isinstance(routes, dict):
             routes = {}
-        changed = False
 
         def show_saved_routes(prompt, saved_routes):
             print(prompt)
             for index, (_, route) in enumerate(saved_routes, 1):
                 print(f"{index}. {route.get('title', 'Без названия')} → {cls._group_route_label(route)}")
+
+        def persist_routes():
+            cls.update_setting("telegram_group_routes", cls._normalize_group_routes(routes))
+            cls.save_config()
 
         while True:
             print("\n" + "-" * 30)
@@ -839,7 +842,7 @@ class Config:
             if choice == "1":
                 dialog = await cls._select_telegram_group(telegram_client, routes)
                 if dialog and cls._configure_telegram_group_route(routes, dialog, is_new=dialog["chat_id"] not in routes):
-                    changed = True
+                    persist_routes()
                 continue
             if choice == "2":
                 if not routes:
@@ -855,12 +858,10 @@ class Config:
                 except (TypeError, ValueError, IndexError):
                     print("❌ Неверный выбор")
                     continue
-                old_title = routes[chat_id].get("title", "Без названия")
-                await cls._refresh_telegram_group_title(telegram_client, routes, chat_id)
-                changed = changed or routes[chat_id].get("title", "Без названия") != old_title
                 dialog = {"chat_id": chat_id, "title": routes[chat_id].get("title", route.get("title", "Без названия"))}
                 if cls._configure_telegram_group_route(routes, dialog, is_new=False):
-                    changed = True
+                    await cls._refresh_telegram_group_title(telegram_client, routes, chat_id)
+                    persist_routes()
                 continue
             if choice == "3":
                 if not routes:
@@ -881,14 +882,10 @@ class Config:
                 if confirmation != "y":
                     continue
                 del routes[chat_id]
-                changed = True
+                persist_routes()
                 print("✅ Беседа удалена")
                 continue
             print("❌ Неверный выбор")
-
-        if changed:
-            cls.update_setting("telegram_group_routes", cls._normalize_group_routes(routes))
-            cls.save_config()
 
     @staticmethod
     def show_current_settings():
