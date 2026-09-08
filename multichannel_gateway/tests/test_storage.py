@@ -32,6 +32,17 @@ class StorageTests(unittest.TestCase):
         saved = self.files.persist_bytes(f"{source}:1:1:0", file_name, b"payload")
         return self.store.enqueue_file(envelope, envelope.attachments[0], saved)
 
+    def test_delivery_pending_survives_reload_and_is_not_reprocessed(self):
+        job = self._enqueue(source="telegram")
+        self.store.mark_delivery_pending(job.job_id, "telegram_outbound_pending")
+        reloaded = SqliteJobStore(self.store.db_path)
+        self.assertEqual("delivery_pending", reloaded.get_job(job.job_id).status)
+        self.assertEqual(0, reloaded.release_stale_processing(0, ("telegram",)))
+        self.assertIsNone(reloaded.claim_next_bridgeable("worker", ("telegram",)))
+        self.assertEqual(1, reloaded.get_stats()["delivery_pending"])
+        reloaded.mark_done(job.job_id, "report.pdf", "delivered")
+        self.assertEqual("done", reloaded.get_job(job.job_id).status)
+
     def test_enqueue_and_claim_bridgeable(self) -> None:
         job = self._enqueue(source="vk")
         claimed = self.store.claim_next_bridgeable("worker", ("vk", "max"))

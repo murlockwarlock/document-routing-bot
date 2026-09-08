@@ -1,4 +1,5 @@
 import os
+import hashlib
 import re
 import asyncio
 import shutil
@@ -2590,6 +2591,7 @@ class BotHandlers:
         self.ai_upload_ready_events = {}  # {account_name: asyncio.Event}
         self.aaa_globally_unavailable = False
         self.outbound_dispatcher = OutboundDispatcher()
+        self._editor_safety_store = None
         self._editor_response_claims = {}
         self._editor_response_unknown_warnings = {}
 
@@ -2954,6 +2956,21 @@ class BotHandlers:
             score += 10
         return score, -ordinal
 
+    def _editor_safety_context(self, info, file_name):
+        editor = self._normalize_editor_destination(info.get("destination"))
+        chat_id = info.get("chat_id")
+        if not editor or chat_id is None or info.get("reply_to_message_id") is None:
+            raise ValueError("editor safety identity is incomplete")
+        task_key = hashlib.sha256(
+            str((info.get("sent_from_account"), str(chat_id), info["reply_to_message_id"], info.get("file_uid"))).encode()
+        ).hexdigest()
+        return editor, str(chat_id), self._editor_report_key(file_name), task_key
+
+    def _get_editor_safety_store(self):
+        if self._editor_safety_store is None:
+            self._editor_safety_store = build_store()
+        return self._editor_safety_store
+
     def find_editor_tracking_for_unreplied_pdf(
         self,
         sender: str,
@@ -3000,6 +3017,14 @@ class BotHandlers:
             ]
             if completed_conflicts:
                 return None, None, f"неоднозначное имя файла: {doc_name} (есть недавно завершенная задача)"
+            try:
+                if self._get_editor_safety_store().editor_report_conflicts(
+                    *self._editor_safety_context(matched_info, doc_name)
+                ):
+                    return None, None, "неоднозначное имя файла: persistent safety history"
+            except Exception as exc:
+                self._log_editor(f"Filename correlation blocked: safety history unavailable: {exc}")
+                return None, None, "safety history unavailable"
             return matched_key, matched_info, "точное совпадение имени файла"
         if len(matches) > 1:
             return None, None, f"неоднозначное имя файла: {doc_name}"
@@ -3062,31 +3087,39 @@ class BotHandlers:
         if not candidates:
             return None, None, "нет файлов Плагискана в обработке"
 
-        if message.reply_to_message_id:
+        if message.reply_to_message_id is not None:
             map_key = f"{message.chat.id}_{message.reply_to_message_id}"
             mapped_key = self.message_to_file_map.get(map_key)
-            if mapped_key:
-                for key, info in candidates:
-                    if key == mapped_key:
-                        return key, info, "reply_to sent_message_id"
+            matches = [(key, info) for key, info in candidates if key == mapped_key]
+            if len(matches) == 1:
+                return *matches[0], "reply_to sent_message_id"
+            return None, None, "unknown or stale Plagiscan reply; correlation stopped"
 
-        candidates.sort(key=lambda item: item[0])
-        response_name = ""
-        if getattr(message, "document", None) and getattr(message.document, "file_name", None):
-            response_name = message.document.file_name
-        elif getattr(message, "text", None):
-            response_name = message.text
+        document = getattr(message, "document", None)
+        text = getattr(message, "text", None) or ""
+        response_name = getattr(document, "file_name", None) if document else None
+        response_name = response_name or self._extract_editor_error_file_name(text)
+        if response_name:
+            matches = []
+            for key, info in candidates:
+                original = info.get("original_file_name") or info.get("original_name") or ""
+                stem = os.path.splitext(os.path.basename(original))[0]
+                names = (original, f"{stem}.pdf", f"ИИ {stem}.pdf")
+                if self._editor_report_key(response_name) in {self._editor_report_key(name) for name in names}:
+                    matches.append((key, info))
+            if len(matches) == 1:
+                return *matches[0], "exact unique filename"
+            return None, None, "ambiguous or unknown Plagiscan filename"
 
-        scored = [
-            (self._editor_name_score(response_name, info, ordinal), key, info)
-            for ordinal, (key, info) in enumerate(candidates)
-        ]
-        scored.sort(key=lambda item: item[0], reverse=True)
-        best_score, best_key, best_info = scored[0]
-        if best_score[0] > 0:
-            return best_key, best_info, f"совпадение ответа с именем файла score={best_score[0]}"
-
-        return candidates[0][0], candidates[0][1], "нет reply/имени, выбран самый старый"
+        is_result = bool(document or getattr(message, "reply_markup", None)) or (
+            self._is_plagiscan_success_message(text) or bool(re.search(r"https?://", text))
+        )
+        if is_result:
+            return None, None, "Plagiscan result without reliable correlation"
+        candidates = [(key, info) for key, info in candidates if not info.get("outbound_pending")]
+        if candidates:
+            return sorted(candidates, key=lambda item: item[0])[0] + ("oldest non-result status",)
+        return None, None, "no pending Plagiscan protocol task"
 
     @staticmethod
     def _is_no_checks_message(text):
@@ -3456,6 +3489,11 @@ class BotHandlers:
         await asyncio.to_thread(store.mark_failed, int(gateway_job_id), str(error_text), retry_delay)
         self._log_gateway(f"gateway_job_failed job_id={gateway_job_id} error={error_text}")
 
+    async def _mark_gateway_job_delivery_pending(self, context, delivery):
+        if context.get("gateway_job_id"):
+            note = f"telegram_outbound_pending: {delivery}"
+            await asyncio.to_thread(build_store().mark_delivery_pending, int(context["gateway_job_id"]), note)
+
     async def _mark_gateway_job_waiting_editor(self, context, note="waiting_editor_response"):
         gateway_job_id = context.get("gateway_job_id") if context else None
         if not gateway_job_id:
@@ -3519,6 +3557,10 @@ class BotHandlers:
             if route_is_group and context.get("route_message_id") is not None:
                 send_kwargs["reply_to_message_id"] = context["route_message_id"]
 
+            source_key = context.get("file_uid") or context.get("gateway_job_id") or (
+                context.get("route_chat_id"), context.get("route_message_id")
+            )
+            spool_key = str(("telegram", source_key, recipient, file_name))
             if not client_nik1.is_connected:
                 try:
                     await client_nik1.connect()
@@ -3533,6 +3575,13 @@ class BotHandlers:
                         client_nik1.send_document(**send_kwargs),
                         timeout=60,
                     )
+                    try:
+                        outbox = self.outbound_dispatcher.outbox
+                        entry_id = outbox.delivery_id(spool_key)
+                        if outbox.get_entry(entry_id):
+                            outbox.mark_sent(entry_id, {"platform": "telegram", "recipient": recipient})
+                    except Exception as exc:
+                        self._log_gateway(f"Telegram sent; outbox acknowledgement failed: {exc}")
                     self._log_gateway(f"deliver_result platform=telegram recipient={recipient} file_name={file_name}")
                     return {"platform": "telegram", "recipient": recipient}
                 except FloodWait as e:
@@ -3575,6 +3624,7 @@ class BotHandlers:
                     caption=caption,
                     file_name=file_name,
                     reason=str(last_exc),
+                    dedupe_key=spool_key,
                 )
                 self._log_gateway(f"telegram_spooled outbox_id={manifest['id']}")
                 return {"platform": "telegram", "status": "spooled", "outbox_id": manifest["id"], "reason": str(last_exc)}
@@ -5266,6 +5316,15 @@ class BotHandlers:
                     self._log_editor(f"⏭️ PDF редактора уже доставлен повторно: {file_name}")
                     return
 
+            if tracking_info.get("fixed_author_editor_route"):
+                report_names = {
+                    file_name, tracking_info.get("expected_pdf_name"), tracking_info.get("expected_ai_pdf_name"),
+                }
+                for report_name in filter(None, report_names):
+                    self._get_editor_safety_store().remember_editor_report(
+                        *self._editor_safety_context(tracking_info, report_name)
+                    )
+
             response_claim_key, claimed = self._claim_editor_response(message)
             if not claimed:
                 return
@@ -5844,6 +5903,37 @@ class BotHandlers:
             traceback.print_exc()
             self.processor.cleanup_temp_files(temp_files_to_cleanup)
 
+    def _release_anti_result_account(self, client, info):
+        if not info.get("result_account_released"):
+            info["result_account_released"] = True
+            self.manager.mark_account_free(client.name, info.get("original_file_name", ""))
+            asyncio.create_task(self.process_queue())
+
+    async def _deliver_anti_result(self, client, info, path, file_name, telegram_client):
+        delivery = None
+        try:
+            delivery = await self._deliver_document_to_origin(
+                info, path, file_name=file_name, telegram_client=telegram_client,
+            )
+            pending = (
+                str(info.get("source_platform") or "telegram").lower() == "telegram"
+                and isinstance(delivery, dict) and delivery.get("status") == "spooled"
+            )
+        except Exception as exc:
+            pending = True
+            self._log_plagiscan(f"Outbound delivery pending: {exc}")
+        if pending:
+            info["outbound_pending"] = True
+            try:
+                await self._mark_gateway_job_delivery_pending(info, delivery)
+            except Exception as exc:
+                self._log_plagiscan(f"Could not persist pending delivery: {exc}")
+            self._release_anti_result_account(client, info)
+            self._log_plagiscan(f"Telegram result pending; tracking retained: {file_name}")
+            return False
+        info.pop("outbound_pending", None)
+        return True
+
     async def handle_anti_bot_response(self, client, message):
         """Обработка ответов от антиплагиат бота"""
         temp_files_to_cleanup = []
@@ -5866,7 +5956,9 @@ class BotHandlers:
             file_key, processing_info, match_reason = self.find_anti_processing_for_response(client.name, message)
 
             if not processing_info:
-                print("⚠️  Не найден соответствующий файл в обработке")
+                warning = f"Plagiscan correlation stopped: {match_reason}"
+                print(warning)
+                self._log_plagiscan(warning)
                 return
             print(f"ℹ️ Ответ Плагискана привязан к {processing_info.get('original_file_name')} ({match_reason})")
 
@@ -5978,6 +6070,8 @@ class BotHandlers:
             # Функция для обработки и отправки отчета
             async def process_and_send_report(report_url, processing_info, file_key, report_kind="main", finish_after=True):
                 """Обработка и отправка отчета"""
+                if processing_info.get(f"{report_kind}_report_delivered"):
+                    return True
                 report_label = "ИИ отчет" if report_kind == "ai" else "отчет"
                 print(f"📄 Скачиваю {report_label} антиплагиата: {report_url[:80]}...")
                 self._log_plagiscan(f"📄 Скачиваю {report_label} антиплагиата: {report_url[:80]}...")
@@ -6004,12 +6098,10 @@ class BotHandlers:
                         temp_files_to_cleanup.append(final_path)
 
                         try:
-                            await self._deliver_document_to_origin(
-                                processing_info,
-                                final_path,
-                                file_name=final_name,
-                                telegram_client=client_nik1,
-                            )
+                            if not await self._deliver_anti_result(
+                                client, processing_info, final_path, final_name, client_nik1,
+                            ):
+                                return False
                             print("✅ Антиплагиат отчет доставлен в исходный канал")
                             self._log_plagiscan("✅ Антиплагиат отчет доставлен в исходный канал")
                             if report_kind == "ai":
@@ -6028,9 +6120,8 @@ class BotHandlers:
 
                             if finish_after:
                                 # Освобождаем аккаунт только от этого файла
-                                self.manager.mark_account_free(client.name, processing_info.get("original_file_name", ""))
+                                self._release_anti_result_account(client, processing_info)
                                 print(f"🔄 Аккаунт {client.name} освобожден от файла: {processing_info.get('original_file_name')}")
-                                asyncio.create_task(self.process_queue())
 
                                 # Удаляем из текущей обработки
                                 if file_key in self.current_processing_files:
@@ -6057,12 +6148,10 @@ class BotHandlers:
                         temp_files_to_cleanup.append(final_path)
 
                         try:
-                            await self._deliver_document_to_origin(
-                                processing_info,
-                                final_path,
-                                file_name=final_name,
-                                telegram_client=client_nik1,
-                            )
+                            if not await self._deliver_anti_result(
+                                client, processing_info, final_path, final_name, client_nik1,
+                            ):
+                                return False
                             print(f"✅ Отправлен необрезанный антиплагиат отчет")
                             self._log_plagiscan("✅ Отправлен необрезанный антиплагиат отчет")
                             if report_kind == "ai":
@@ -6072,13 +6161,12 @@ class BotHandlers:
                             if finish_after:
                                 self._finish_processing(processing_info.get("file_uid"), True)
                                 await self._mark_gateway_job_done(processing_info, final_path, "anti_report_delivered_uncropped")
-                                self.manager.mark_account_free(client.name, processing_info.get("original_file_name", ""))
+                                self._release_anti_result_account(client, processing_info)
                                 print(f"🔄 Аккаунт {client.name} освобожден от файла: {processing_info.get('original_file_name')}")
 
                                 if file_key in self.current_processing_files:
                                     del self.current_processing_files[file_key]
 
-                                asyncio.create_task(self.process_queue())
                             return True
                         except Exception as e:
                             print(f"❌ Ошибка доставки необрезанного результата в исходный канал: {e}")
@@ -6130,7 +6218,9 @@ class BotHandlers:
                     try:
                         if getattr(report_button, 'url', None):
                             finish_after = not (need_ai_report and ai_report_button)
-                            await process_and_send_report(report_button.url, processing_info, file_key, "main", finish_after)
+                            if not await process_and_send_report(report_button.url, processing_info, file_key, "main", finish_after):
+                                self.processor.cleanup_temp_files(temp_files_to_cleanup)
+                                return
                             if need_ai_report and ai_report_button and getattr(ai_report_button, 'url', None):
                                 await process_and_send_report(ai_report_button.url, processing_info, file_key, "ai", True)
                             elif need_ai_report and ai_report_button:
@@ -6171,9 +6261,8 @@ class BotHandlers:
                     print("ℹ️  Кнопка отчета не найдена, файл проверен")
 
                     # Освобождаем аккаунт только от этого файла
-                    self.manager.mark_account_free(client.name, processing_info.get("original_file_name", ""))
+                    self._release_anti_result_account(client, processing_info)
                     print(f"🔄 Аккаунт {client.name} освобожден от файла: {processing_info.get('original_file_name')}")
-                    asyncio.create_task(self.process_queue())
 
                     # Удаляем из текущей обработки
                     if file_key in self.current_processing_files:
@@ -6227,12 +6316,11 @@ class BotHandlers:
 
                 # Отправляем автору
                 try:
-                    await self._deliver_document_to_origin(
-                        processing_info,
-                        final_path,
-                        file_name=final_name,
-                        telegram_client=client_nik1,
-                    )
+                    if not await self._deliver_anti_result(
+                        client, processing_info, final_path, final_name, client_nik1,
+                    ):
+                        self.processor.cleanup_temp_files(temp_files_to_cleanup)
+                        return
                     print(f"✅ Отчет антиплагиата отправлен автору")
                     self._log_plagiscan("✅ Отчет антиплагиата отправлен автору")
                     if report_kind == "ai":
@@ -6258,9 +6346,8 @@ class BotHandlers:
                         await self._mark_gateway_job_done(processing_info, final_path, "anti_pdf_document_delivered")
 
                     if finish_after:
-                        self.manager.mark_account_free(client.name, processing_info.get("original_file_name", ""))
+                        self._release_anti_result_account(client, processing_info)
                         print(f"🔄 Аккаунт {client.name} освобожден от файла: {processing_info.get('original_file_name')}")
-                        asyncio.create_task(self.process_queue())
 
                         if file_key in self.current_processing_files:
                             del self.current_processing_files[file_key]

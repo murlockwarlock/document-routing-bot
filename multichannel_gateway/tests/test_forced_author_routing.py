@@ -32,6 +32,7 @@ sys.modules["pyrogram.errors"].FloodWait = _FakeFloodWait
 
 from bot_handlers import BotHandlers
 from config import AccountManager, Config
+from multichannel_gateway.core.storage import SqliteJobStore
 
 
 def make_manager():
@@ -47,7 +48,10 @@ def make_manager():
 
 
 def make_handlers(manager=None):
-    return BotHandlers(manager or make_manager())
+    handlers = BotHandlers(manager or make_manager())
+    handlers._safety_test_dir = tempfile.TemporaryDirectory()
+    handlers._editor_safety_store = SqliteJobStore(Path(handlers._safety_test_dir.name) / "jobs.sqlite3")
+    return handlers
 
 
 def settings_lookup(settings):
@@ -1412,8 +1416,11 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
         source_count = handlers.files_today["count"]
 
         class PyrogramLikeMessage(SimpleNamespace):
+            def __copy__(self):
+                return type(self)(**{key: value for key, value in vars(self).items() if key != "_client"})
+
             async def download(self, path):
-                if not hasattr(self, "_client"):
+                if self is not self.original or not hasattr(self, "_client"):
                     raise AssertionError("download must use the original Pyrogram message")
                 Path(path).write_bytes(self.payload)
                 return path
@@ -1436,6 +1443,11 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
             from_user=SimpleNamespace(username="fixed-editor", id=9000),
             payload=b"ai",
         )
+        normal.original = normal
+        ai.original = ai
+        from copy import copy
+        with self.assertRaises(AssertionError):
+            await copy(normal).download("must-not-be-written.pdf")
         client = SimpleNamespace(name="НИК-2")
 
         with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)), patch(

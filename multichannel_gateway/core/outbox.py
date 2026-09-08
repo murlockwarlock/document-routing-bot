@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import tempfile
 import shutil
 import uuid
 from datetime import datetime, timezone
@@ -32,13 +35,18 @@ class LocalOutboxSpool:
         caption: str | None = None,
         file_name: str | None = None,
         reason: str | None = None,
+        dedupe_key: str | None = None,
     ) -> dict[str, Any]:
         source = (source_platform or "unknown").lower()
         source_path = Path(file_path)
         if not source_path.exists():
             raise FileNotFoundError(source_path)
 
-        entry_id = uuid.uuid4().hex
+        entry_id = self.delivery_id(dedupe_key) if dedupe_key else uuid.uuid4().hex
+        if dedupe_key:
+            existing = self.get_entry(entry_id)
+            if existing is not None:
+                return existing
         stored_name = f"{entry_id}_{file_name or source_path.name}"
         stored_file_path = self.files_dir / stored_name
         shutil.copy2(source_path, stored_file_path)
@@ -62,6 +70,10 @@ class LocalOutboxSpool:
         }
         self._write_manifest(entry_id, manifest)
         return manifest
+
+    @staticmethod
+    def delivery_id(dedupe_key):
+        return hashlib.sha256(dedupe_key.encode()).hexdigest()
 
     def list_entries(self, limit: int = 50, pending_only: bool = False) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
@@ -146,7 +158,13 @@ class LocalOutboxSpool:
 
     def _write_manifest(self, entry_id: str, payload: dict[str, Any]) -> None:
         manifest_path = self.meta_dir / f"{entry_id}.json"
-        manifest_path.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
-            encoding="utf-8",
-        )
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.meta_dir, delete=False) as handle:
+            temp_path = Path(handle.name)
+            try:
+                json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+                os.replace(temp_path, manifest_path)
+            finally:
+                if temp_path.exists():
+                    temp_path.unlink()

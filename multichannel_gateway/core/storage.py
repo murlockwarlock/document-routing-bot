@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,6 +32,9 @@ def _json_safe(value: Any) -> Any:
 
 
 class SqliteJobStore:
+    EDITOR_SAFETY_RETENTION = 30 * 24 * 60 * 60
+    EDITOR_SAFETY_MAX_RECORDS = 100000
+
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,6 +90,62 @@ class SqliteJobStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_status_next_attempt ON jobs(status, next_attempt_at, created_at)"
             )
+
+    def _prepare_editor_safety(self, connection, now):
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS editor_report_safety ("
+            "editor TEXT NOT NULL, chat_id TEXT NOT NULL, report_key TEXT NOT NULL, "
+            "task_key TEXT NOT NULL, recorded_at REAL NOT NULL, "
+            "PRIMARY KEY (editor, chat_id, report_key, task_key))"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_editor_safety_time ON editor_report_safety(recorded_at)"
+        )
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS editor_safety_state ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), blocked_until REAL NOT NULL)"
+        )
+        connection.execute(
+            "DELETE FROM editor_report_safety WHERE recorded_at <= ?",
+            (now - self.EDITOR_SAFETY_RETENTION,),
+        )
+
+    def remember_editor_report(self, editor, chat_id, report_key, task_key, now=None):
+        now = time.time() if now is None else now
+        with self._lock, self._connect() as connection:
+            self._prepare_editor_safety(connection, now)
+            existing = connection.execute(
+                "SELECT 1 FROM editor_report_safety WHERE editor=? AND chat_id=? AND report_key=? AND task_key=?",
+                (editor, str(chat_id), report_key, task_key),
+            ).fetchone()
+            count = connection.execute("SELECT COUNT(*) FROM editor_report_safety").fetchone()[0]
+            if existing or count < self.EDITOR_SAFETY_MAX_RECORDS:
+                connection.execute(
+                    "INSERT OR REPLACE INTO editor_report_safety VALUES (?, ?, ?, ?, ?)",
+                    (editor, str(chat_id), report_key, task_key, now),
+                )
+            else:
+                connection.execute(
+                    "INSERT OR REPLACE INTO editor_safety_state VALUES (1, ?)",
+                    (now + self.EDITOR_SAFETY_RETENTION,),
+                )
+            connection.commit()
+
+    def editor_report_conflicts(self, editor, chat_id, report_key, task_key, now=None):
+        now = time.time() if now is None else now
+        with self._lock, self._connect() as connection:
+            self._prepare_editor_safety(connection, now)
+            blocked = connection.execute(
+                "SELECT 1 FROM editor_safety_state WHERE blocked_until > ?", (now,)
+            ).fetchone()
+            conflict = connection.execute(
+                "SELECT 1 FROM editor_report_safety "
+                "WHERE editor=? AND chat_id=? AND report_key=? AND task_key<>? LIMIT 1",
+                (editor, str(chat_id), report_key, task_key),
+            ).fetchone()
+            connection.commit()
+            return bool(blocked or conflict)
 
     def enqueue_file(self, envelope: InboundEnvelope, attachment: AttachmentRef, saved_file: SavedFile) -> JobRecord:
         dedupe_key = envelope.attachment_dedupe_key(attachment)
@@ -259,6 +319,14 @@ class SqliteJobStore:
                 (status, error_text[:2000], next_attempt_at, now.isoformat(), job_id),
             )
 
+    def mark_delivery_pending(self, job_id: int, note: str):
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "UPDATE jobs SET status='delivery_pending', last_error=?, next_attempt_at=NULL, "
+                "locked_by=NULL, locked_at=NULL, updated_at=? WHERE id=?",
+                (note, utc_now_iso(), job_id),
+            )
+
     def mark_waiting_editor(self, job_id: int, note: str | None = None) -> None:
         now = utc_now_iso()
         with self._lock, self._connect() as connection:
@@ -345,7 +413,7 @@ class SqliteJobStore:
                 GROUP BY status
                 """
             ).fetchall()
-        stats = {"queued": 0, "processing": 0, "awaiting_editor": 0, "done": 0, "failed": 0}
+        stats = {"queued": 0, "processing": 0, "awaiting_editor": 0, "delivery_pending": 0, "done": 0, "failed": 0}
         for row in rows:
             stats[row["status"]] = row["total"]
         stats["total"] = sum(stats.values())

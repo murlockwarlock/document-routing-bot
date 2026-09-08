@@ -61,6 +61,9 @@ def _make_handlers(manager=None):
         mock_config.get_setting.return_value = None
         mgr = manager or _make_account_manager()
         handlers = BotHandlers(mgr)
+        from multichannel_gateway.core.storage import SqliteJobStore
+        handlers._safety_test_dir = tempfile.TemporaryDirectory()
+        handlers._editor_safety_store = SqliteJobStore(Path(handlers._safety_test_dir.name) / "jobs.sqlite3")
     return handlers
 
 
@@ -693,6 +696,7 @@ class TestEditorPdfMatching(unittest.TestCase):
             "first": {
                 "sent_from_account": "НИК-2",
                 "destination": "@editor",
+                "chat_id": 1000,
                 "original_name": "work.docx",
                 "original_name_without_ext": "work",
                 "expected_pdf_name": "work.pdf",
@@ -702,6 +706,7 @@ class TestEditorPdfMatching(unittest.TestCase):
             "second": {
                 "sent_from_account": "НИК-2",
                 "destination": "@editor",
+                "chat_id": 1000,
                 "original_name": "work (1).docx",
                 "original_name_without_ext": "work (1)",
                 "expected_pdf_name": "work (1).pdf",
@@ -802,7 +807,7 @@ class TestPlagiscanParallelResponseMatching(unittest.TestCase):
         self.assertEqual("same.docx", info["original_file_name"])
         self.assertIn("reply_to", reason)
 
-    def test_no_reply_pdf_suffix_maps_to_second_parallel_duplicate(self):
+    def test_no_reply_pdf_suffix_does_not_guess_parallel_duplicate(self):
         handlers = _make_handlers()
         handlers.current_processing_files = {
             "anti-001": {
@@ -825,11 +830,11 @@ class TestPlagiscanParallelResponseMatching(unittest.TestCase):
 
         key, info, reason = handlers.find_anti_processing_for_response("НИК-2", message)
 
-        self.assertEqual("anti-002", key)
-        self.assertEqual("work.docx", info["original_file_name"])
-        self.assertIn("score", reason)
+        self.assertIsNone(key)
+        self.assertIsNone(info)
+        self.assertIn("unknown", reason)
 
-    def test_no_reply_and_no_name_falls_back_to_oldest_parallel_file(self):
+    def test_no_reply_result_without_name_does_not_choose_oldest(self):
         handlers = _make_handlers()
         handlers.current_processing_files = {
             "anti-010": {
@@ -852,9 +857,9 @@ class TestPlagiscanParallelResponseMatching(unittest.TestCase):
 
         key, info, reason = handlers.find_anti_processing_for_response("НИК-2", message)
 
-        self.assertEqual("anti-010", key)
-        self.assertEqual("first.docx", info["original_file_name"])
-        self.assertIn("самый старый", reason)
+        self.assertIsNone(key)
+        self.assertIsNone(info)
+        self.assertIn("correlation", reason)
 
 
 class TestPlagiscanReportButtons(unittest.TestCase):
@@ -888,6 +893,7 @@ class TestPlagiscanScenarioHandling(unittest.TestCase):
         self.handlers.file_tracking = {"vk-user": {"sent": [], "received": [], "pending": [], "sent_to_editor": []}}
         self.handlers.manager.mark_account_free = Mock()
         self.handlers.process_queue = AsyncMock()
+        self.handlers.message_to_file_map = {"999_23": "anti-key"}
         self.handlers._finish_processing = Mock()
         self.handlers._mark_gateway_job_done = AsyncMock()
         self.handlers._deliver_document_to_origin = AsyncMock(return_value={"platform": "vk", "status": "sent"})
@@ -931,7 +937,7 @@ class TestPlagiscanScenarioHandling(unittest.TestCase):
         ai_button = SimpleNamespace(text="Посмотреть отчет по ИИ", url="https://example.com/ai.pdf")
         message = SimpleNamespace(
             text="✅ Ваш файл успешно проверен!\nОригинальность: 59.06%\nМашинная генерация: 21.2%",
-            reply_to_message_id=None,
+            reply_to_message_id=23,
             chat=SimpleNamespace(id=999),
             id=1000,
             reply_markup=SimpleNamespace(inline_keyboard=[[main_button, ai_button]]),
@@ -955,7 +961,7 @@ class TestPlagiscanScenarioHandling(unittest.TestCase):
         ai_button = SimpleNamespace(text="Посмотреть отчет по ИИ", url="https://example.com/ai.pdf")
         message = SimpleNamespace(
             text="✅ Ваш файл успешно проверен!\nОригинальность: 59.06%\nМашинная генерация: 21.2%",
-            reply_to_message_id=None,
+            reply_to_message_id=23,
             chat=SimpleNamespace(id=999),
             id=1000,
             reply_markup=SimpleNamespace(inline_keyboard=[[main_button, ai_button]]),
@@ -978,7 +984,7 @@ class TestPlagiscanScenarioHandling(unittest.TestCase):
         ai_button = SimpleNamespace(text="Посмотреть отчет по ИИ", url="https://example.com/ai.pdf")
         message = SimpleNamespace(
             text="✅ Ваш файл успешно проверен!\nОригинальность: 90%\nМашинная генерация: 0%",
-            reply_to_message_id=None,
+            reply_to_message_id=23,
             chat=SimpleNamespace(id=999),
             id=1000,
             reply_markup=SimpleNamespace(inline_keyboard=[[main_button, ai_button]]),
@@ -1004,7 +1010,7 @@ class TestPlagiscanScenarioHandling(unittest.TestCase):
                 "У вас закончились проверки 😉\n"
                 "Перейдите в раздел оплата /payment, чтобы пополнить баланс проверок."
             ),
-            reply_to_message_id=None,
+            reply_to_message_id=23,
             chat=SimpleNamespace(id=999),
             id=1000,
             reply_markup=SimpleNamespace(inline_keyboard=[[main_button]]),
@@ -3232,6 +3238,7 @@ class TestEditorResponseOriginalFilename(unittest.IsolatedAsyncioTestCase):
                 "sent_from_account": "НИК-2",
                 "reply_to_message_id": 100,
                 "destination": "@editor",
+                "chat_id": 1000,
                 "file_uid": "telegram:a:1:0",
                 "sent_at": datetime(2026, 5, 20, 10, 0),
             },
@@ -3244,6 +3251,7 @@ class TestEditorResponseOriginalFilename(unittest.IsolatedAsyncioTestCase):
                 "sent_from_account": "НИК-2",
                 "reply_to_message_id": 101,
                 "destination": "@editor",
+                "chat_id": 1000,
                 "file_uid": "telegram:b:1:0",
                 "sent_at": datetime(2026, 5, 20, 10, 1),
             },
@@ -3258,6 +3266,7 @@ class TestEditorResponseOriginalFilename(unittest.IsolatedAsyncioTestCase):
         msg = MagicMock()
         msg.reply_to_message_id = info["reply_to_message_id"]
         msg.document = doc
+        msg.chat = SimpleNamespace(id=1000)
         msg.from_user = SimpleNamespace(username="editor", id=1000)
         msg.download = AsyncMock(side_effect=lambda path: path)
 
@@ -3418,6 +3427,7 @@ class TestEditorResponseOriginalFilename(unittest.IsolatedAsyncioTestCase):
             "sent_from_account": "НИК-2",
             "reply_to_message_id": 900,
             "destination": "@editor247",
+            "chat_id": 1000,
         }
         handlers.editor_tracking["24_7_911"] = {
             "expected_pdf_name": "374911.pdf",
@@ -3426,6 +3436,7 @@ class TestEditorResponseOriginalFilename(unittest.IsolatedAsyncioTestCase):
             "sent_from_account": "НИК-2",
             "reply_to_message_id": 911,
             "destination": "@editor247",
+            "chat_id": 1000,
         }
 
         key, info, reason = handlers.find_editor_tracking_for_text_response(
