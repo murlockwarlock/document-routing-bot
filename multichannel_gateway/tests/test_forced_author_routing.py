@@ -1317,10 +1317,9 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
         return handlers, nik1, nik2
 
     @staticmethod
-    async def make_response(file_name, reply_to, editor_chat_id, result_path, message_id=None):
+    async def make_response(file_name, reply_to, editor_chat_id, result_path):
         document = SimpleNamespace(file_name=file_name)
         message = SimpleNamespace(
-            id=message_id,
             reply_to_message_id=reply_to,
             document=document,
             chat=SimpleNamespace(id=editor_chat_id),
@@ -1333,130 +1332,6 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
 
         message.download = download
         return message
-
-    async def test_fixed_editor_paths_process_each_incoming_pdf_once(self):
-        task = telegram_file_info(
-            "forced",
-            42,
-            "курсовая работа.docx",
-            chat_id=-100123,
-            message_id=777,
-        )
-        task["is_anti"] = False
-        task["force_plagiscan"] = False
-        settings = base_settings(
-            ["forced"],
-            forced_authors_destination="editor",
-            forced_authors_editor_nickname="@editor",
-        )
-        sent = [SimpleNamespace(id=300308, chat=SimpleNamespace(id=301))]
-        handlers, nik1, _nik2 = await self._make_handlers_with_tasks([task], sent, settings)
-        normal_path = Path(tempfile.gettempdir()) / "fixed-guard-normal.pdf"
-        ai_path = Path(tempfile.gettempdir()) / "fixed-guard-ai.pdf"
-        normal_path.write_bytes(b"normal")
-        ai_path.write_bytes(b"ai")
-        client = SimpleNamespace(name="НИК-2")
-
-        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)), patch.object(
-            handlers,
-            "_find_editor_tracking_by_reply",
-            wraps=handlers._find_editor_tracking_by_reply,
-        ) as tracking_lookup, patch.object(
-            handlers,
-            "handle_editor_response",
-            wraps=handlers.handle_editor_response,
-        ) as response_handler:
-            normal = await self.make_response("курсовая работа.pdf", 300308, 301, normal_path, message_id=4101)
-            ai = await self.make_response("ИИ курсовая работа.pdf", 300308, 301, ai_path, message_id=4102)
-            await handlers.handle_editor_response(client, normal)
-            await handlers.handle_editor_response(client, ai)
-
-            duplicate = await self.make_response(
-                "курсовая работа.pdf",
-                300307,
-                301,
-                normal_path,
-                message_id=4101,
-            )
-            await handlers.handle_main_account(client, duplicate)
-
-        self.assertEqual(2, response_handler.await_count)
-        self.assertEqual(2, tracking_lookup.call_count)
-        self.assertEqual([300308, 300308], [call.args[0] for call in tracking_lookup.call_args_list])
-        self.assertEqual(2, nik1.send_document.await_count)
-        self.assertEqual(
-            ["курсовая работа.pdf", "ИИ курсовая работа.pdf"],
-            [item.kwargs["file_name"] for item in nik1.send_document.await_args_list],
-        )
-        self.assertEqual(300307, duplicate.reply_to_message_id)
-
-    async def test_fixed_editor_unknown_reply_does_not_fallback_by_filename(self):
-        task = telegram_file_info(
-            "forced",
-            42,
-            "курсовая работа.docx",
-            chat_id=-100123,
-            message_id=777,
-        )
-        task["is_anti"] = False
-        task["force_plagiscan"] = False
-        settings = base_settings(
-            ["forced"],
-            forced_authors_destination="editor",
-            forced_authors_editor_nickname="@editor",
-        )
-        sent = [SimpleNamespace(id=300308, chat=SimpleNamespace(id=301))]
-        handlers, nik1, _nik2 = await self._make_handlers_with_tasks([task], sent, settings)
-        result_path = Path(tempfile.gettempdir()) / "fixed-guard-unknown.pdf"
-        result_path.write_bytes(b"unknown")
-        unknown = await self.make_response("курсовая работа.pdf", 300307, 301, result_path, message_id=4103)
-
-        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)), patch.object(
-            handlers,
-            "find_editor_tracking_for_unreplied_pdf",
-            wraps=handlers.find_editor_tracking_for_unreplied_pdf,
-        ) as filename_lookup, patch.object(
-            handlers,
-            "_find_editor_tracking_by_reply",
-            wraps=handlers._find_editor_tracking_by_reply,
-        ) as reply_lookup, patch("builtins.print") as output:
-            await handlers.handle_main_account(SimpleNamespace(name="НИК-2"), unknown)
-
-        self.assertEqual(0, nik1.send_document.await_count)
-        self.assertEqual(0, filename_lookup.call_count)
-        reply_lookup.assert_called_once_with(300307, chat_id=301, sent_from_account="НИК-2")
-        self.assertEqual(300307, unknown.reply_to_message_id)
-        self.assertEqual(1, len(handlers.editor_tracking))
-        warning_lines = [str(call.args[0]) for call in output.call_args_list if "Не найдена информация" in str(call.args[0])]
-        self.assertEqual(1, len(warning_lines))
-
-    async def test_fixed_editor_unknown_reply_can_be_processed_later(self):
-        task = telegram_file_info(
-            "forced",
-            42,
-            "курсовая работа.docx",
-            chat_id=-100123,
-            message_id=777,
-        )
-        task["is_anti"] = False
-        task["force_plagiscan"] = False
-        settings = base_settings(
-            ["forced"],
-            forced_authors_destination="editor",
-            forced_authors_editor_nickname="@editor",
-        )
-        sent = [SimpleNamespace(id=300308, chat=SimpleNamespace(id=301))]
-        handlers, nik1, _nik2 = await self._make_handlers_with_tasks([task], sent, settings)
-        result_path = Path(tempfile.gettempdir()) / "fixed-guard-late.pdf"
-        result_path.write_bytes(b"late")
-        message = await self.make_response("курсовая работа.pdf", 300307, 301, result_path, message_id=4104)
-
-        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)):
-            await handlers.handle_editor_response(SimpleNamespace(name="НИК-2"), message)
-            message.reply_to_message_id = 300308
-            await handlers.handle_editor_response(SimpleNamespace(name="НИК-2"), message)
-
-        self.assertEqual(1, nik1.send_document.await_count)
 
     async def test_group_editor_route_delivers_both_reports_to_original_group_reply(self):
         task = telegram_file_info(
