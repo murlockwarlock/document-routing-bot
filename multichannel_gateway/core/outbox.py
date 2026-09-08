@@ -112,6 +112,22 @@ class LocalOutboxSpool:
         self._write_manifest(entry_id, payload)
         return payload
 
+    def abandon_telegram_before(self, cutoff_iso: str) -> int:
+        cutoff = datetime.fromisoformat(cutoff_iso)
+        abandoned = 0
+        for manifest_path in self.meta_dir.glob("*.json"):
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if payload.get("source_platform") != "telegram" or payload.get("status") != "pending":
+                continue
+            if datetime.fromisoformat(payload["created_at"]) >= cutoff:
+                continue
+            payload["status"] = "abandoned"
+            payload["reason"] = "abandoned_on_restart"
+            payload["updated_at"] = utc_now_iso()
+            self._write_manifest(payload["id"], payload)
+            abandoned += 1
+        return abandoned
+
     def archive_sent(self, limit: int = 100) -> list[str]:
         archived: list[str] = []
         for payload in self.list_entries(limit=limit * 5, pending_only=False):

@@ -141,11 +141,71 @@ class SqliteJobStore:
             ).fetchone()
             conflict = connection.execute(
                 "SELECT 1 FROM editor_report_safety "
-                "WHERE editor=? AND chat_id=? AND report_key=? AND task_key<>? LIMIT 1",
+                "WHERE ((editor=? AND chat_id=?) OR (editor='*' AND chat_id='*')) "
+                "AND report_key=? AND task_key<>? LIMIT 1",
                 (editor, str(chat_id), report_key, task_key),
             ).fetchone()
             connection.commit()
             return bool(blocked or conflict)
+
+    def abandon_telegram_runtime(self, cutoff_iso: str) -> int:
+        cutoff = datetime.fromisoformat(cutoff_iso).astimezone(timezone.utc)
+        now = cutoff.timestamp()
+        oldest = (cutoff - timedelta(seconds=self.EDITOR_SAFETY_RETENTION)).isoformat()
+        with self._lock, self._connect() as connection:
+            self._prepare_editor_safety(connection, now)
+            rows = connection.execute(
+                "SELECT original_file_name, MAX(created_at) AS last_seen, "
+                "MAX(CASE WHEN status IN ('queued', 'processing', 'awaiting_editor', 'delivery_pending') "
+                "THEN 1 ELSE 0 END) AS unfinished FROM jobs "
+                "WHERE created_at < ? AND (created_at > ? OR status IN "
+                "('queued', 'processing', 'awaiting_editor', 'delivery_pending')) "
+                "GROUP BY original_file_name LIMIT ?",
+                (cutoff.isoformat(), oldest, self.EDITOR_SAFETY_MAX_RECORDS + 1),
+            )
+            count = connection.execute("SELECT COUNT(*) FROM editor_report_safety").fetchone()[0]
+            for row_number, row in enumerate(rows):
+                if row_number >= self.EDITOR_SAFETY_MAX_RECORDS:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO editor_safety_state VALUES (1, ?)",
+                        (now + self.EDITOR_SAFETY_RETENTION,),
+                    )
+                    break
+                stem = Path(row["original_file_name"]).stem
+                recorded_at = now if row["unfinished"] else datetime.fromisoformat(row["last_seen"]).timestamp()
+                for name in (f"{stem}.pdf", f"ИИ {stem}.pdf"):
+                    report_key = " ".join(name.split()).casefold()
+                    existing = connection.execute(
+                        "SELECT 1 FROM editor_report_safety "
+                        "WHERE editor='*' AND chat_id='*' AND report_key=? AND task_key='restart'",
+                        (report_key,),
+                    ).fetchone()
+                    if not existing and count >= self.EDITOR_SAFETY_MAX_RECORDS:
+                        connection.execute(
+                            "INSERT OR REPLACE INTO editor_safety_state VALUES (1, ?)",
+                            (now + self.EDITOR_SAFETY_RETENTION,),
+                        )
+                        break
+                    connection.execute(
+                        "INSERT INTO editor_report_safety VALUES ('*', '*', ?, 'restart', ?) "
+                        "ON CONFLICT(editor, chat_id, report_key, task_key) DO UPDATE "
+                        "SET recorded_at=MAX(recorded_at, excluded.recorded_at)",
+                        (report_key, recorded_at),
+                    )
+                    if not existing:
+                        count += 1
+                else:
+                    continue
+                break
+            result = connection.execute(
+                "UPDATE jobs SET status='abandoned', last_error='abandoned_on_restart', "
+                "next_attempt_at=NULL, locked_by=NULL, locked_at=NULL, updated_at=? "
+                "WHERE source='telegram' AND created_at < ? "
+                "AND status IN ('queued', 'processing', 'awaiting_editor', 'delivery_pending')",
+                (cutoff.isoformat(), cutoff.isoformat()),
+            )
+            connection.commit()
+            return result.rowcount
 
     def enqueue_file(self, envelope: InboundEnvelope, attachment: AttachmentRef, saved_file: SavedFile) -> JobRecord:
         dedupe_key = envelope.attachment_dedupe_key(attachment)
@@ -413,7 +473,7 @@ class SqliteJobStore:
                 GROUP BY status
                 """
             ).fetchall()
-        stats = {"queued": 0, "processing": 0, "awaiting_editor": 0, "delivery_pending": 0, "done": 0, "failed": 0}
+        stats = {"queued": 0, "processing": 0, "awaiting_editor": 0, "delivery_pending": 0, "abandoned": 0, "done": 0, "failed": 0}
         for row in rows:
             stats[row["status"]] = row["total"]
         stats["total"] = sum(stats.values())

@@ -2964,7 +2964,7 @@ class BotHandlers:
         task_key = hashlib.sha256(
             str((info.get("sent_from_account"), str(chat_id), info["reply_to_message_id"], info.get("file_uid"))).encode()
         ).hexdigest()
-        return editor, str(chat_id), self._editor_report_key(file_name), task_key
+        return editor, str(chat_id), self._editor_report_key(os.path.splitext(file_name)[0] + ".pdf"), task_key
 
     def _get_editor_safety_store(self):
         if self._editor_safety_store is None:
@@ -3108,6 +3108,15 @@ class BotHandlers:
                 if self._editor_report_key(response_name) in {self._editor_report_key(name) for name in names}:
                     matches.append((key, info))
             if len(matches) == 1:
+                try:
+                    if self._get_editor_safety_store().editor_report_conflicts(
+                        "plagiscan", str(message.chat.id),
+                        self._editor_report_key(os.path.splitext(response_name)[0] + ".pdf"), "active",
+                    ):
+                        return None, None, "Plagiscan filename blocked by restart safety history"
+                except Exception as exc:
+                    self._log_plagiscan(f"Plagiscan safety history unavailable: {exc}")
+                    return None, None, "Plagiscan safety history unavailable"
                 return *matches[0], "exact unique filename"
             return None, None, "ambiguous or unknown Plagiscan filename"
 
@@ -4118,6 +4127,10 @@ class BotHandlers:
                 if not ingest_jobs:
                     raise RuntimeError("Gateway не создал job для входящего документа")
                 ingest_job = ingest_jobs[0]
+                if getattr(ingest_job, "status", None) in {"abandoned", "done"}:
+                    await self.manager.set_file_status(file_uid, "IGNORED")
+                    self._log_gateway(f"Historical Telegram source ignored: job={ingest_job.job_id}")
+                    return
                 local_path = ingest_job.file_path
                 gateway_job_id = ingest_job.job_id
                 file_uid = ingest_job.dedupe_key

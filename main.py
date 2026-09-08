@@ -725,6 +725,15 @@ class FileDistributionBot:
 
         return True
 
+    async def prepare_clean_start(self, cutoff_iso):
+        abandoned_jobs = await asyncio.to_thread(self.gateway_store.abandon_telegram_runtime, cutoff_iso)
+        abandoned_outbox = await asyncio.to_thread(
+            self.handlers.outbound_dispatcher.outbox.abandon_telegram_before, cutoff_iso,
+        )
+        append_channel_log(
+            "gateway", f"Clean start: abandoned Telegram jobs={abandoned_jobs}, outbox={abandoned_outbox}",
+        )
+
     async def run_bot(self):
         """Запуск бота в рабочем режиме"""
         # Настройка перед запуском
@@ -766,6 +775,7 @@ class FileDistributionBot:
         # Получаем настройки
         settings = Config.get_all_settings()
         self.external_start_iso = datetime.now().astimezone().isoformat()
+        await self.prepare_clean_start(self.external_start_iso)
 
         # Запускаем все клиенты
         clients_started = []
