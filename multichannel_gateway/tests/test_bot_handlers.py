@@ -3539,8 +3539,70 @@ class TestEditorResponseOriginalFilename(unittest.IsolatedAsyncioTestCase):
         client.name = "НИК-2"
         await handlers.handle_main_account(client, msg)
 
-        self.assertEqual(705, msg.reply_to_message_id)
-        handlers.handle_editor_response.assert_awaited_once_with(client, msg)
+        self.assertIsNone(msg.reply_to_message_id)
+        handlers.handle_editor_response.assert_awaited_once_with(
+            client,
+            msg,
+            resolved_reply_to_message_id=705,
+        )
+
+    async def test_main_account_pdf_without_reply_passes_resolved_id_without_mutation(self):
+        handlers = _make_handlers()
+        handlers.handle_editor_response = AsyncMock()
+        handlers.editor_tracking["no_checks_706"] = {
+            "sent_from_account": "НИК-2",
+            "reply_to_message_id": 706,
+            "chat_id": 301,
+            "destination": "@Xlistyara",
+            "original_name": "325452 анти.docx",
+            "expected_pdf_name": "325452 анти.pdf",
+            "file_uid": "telegram:806750628:13024:0",
+        }
+
+        msg = MagicMock()
+        msg.document = SimpleNamespace(file_name="325452 анти.pdf")
+        msg.text = None
+        msg.reply_to_message_id = None
+        msg.chat = SimpleNamespace(id=301)
+        msg.from_user = SimpleNamespace(username="Xlistyara", id=806750628)
+
+        client = MagicMock()
+        client.name = "НИК-2"
+        await handlers.handle_main_account(client, msg)
+
+        self.assertIsNone(msg.reply_to_message_id)
+        handlers.handle_editor_response.assert_awaited_once_with(
+            client,
+            msg,
+            resolved_reply_to_message_id=706,
+        )
+
+    async def test_main_account_unknown_reply_does_not_use_filename_fallback(self):
+        handlers = _make_handlers()
+        handlers.handle_editor_response = AsyncMock()
+        handlers.editor_tracking["no_checks_707"] = {
+            "sent_from_account": "НИК-2",
+            "reply_to_message_id": 707,
+            "chat_id": 301,
+            "destination": "@Xlistyara",
+            "original_name": "325453 анти.docx",
+            "expected_pdf_name": "325453 анти.pdf",
+            "file_uid": "telegram:806750628:13025:0",
+        }
+
+        msg = MagicMock()
+        msg.document = SimpleNamespace(file_name="325453 анти.pdf")
+        msg.text = None
+        msg.reply_to_message_id = 706
+        msg.chat = SimpleNamespace(id=301)
+        msg.from_user = SimpleNamespace(username="Xlistyara", id=806750628)
+
+        client = MagicMock()
+        client.name = "НИК-2"
+        with patch("builtins.print"):
+            await handlers.handle_main_account(client, msg)
+
+        handlers.handle_editor_response.assert_not_awaited()
 
 
 # ══════════════════════════════════════════════════════════════════════════════

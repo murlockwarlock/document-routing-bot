@@ -812,9 +812,14 @@ class FileDistributionBot:
                                 f"ℹ️ Текст от редактора {sender} привязан: "
                                 f"{tracking_key} ({reason})"
                             )
-                            if not message.reply_to_message_id:
-                                message.reply_to_message_id = matched_info["reply_to_message_id"]
-                            await self.handlers.handle_editor_response(client, message)
+                            if message.reply_to_message_id:
+                                await self.handlers.handle_editor_response(client, message)
+                            else:
+                                await self.handlers.handle_editor_response(
+                                    client,
+                                    message,
+                                    resolved_reply_to_message_id=matched_info["reply_to_message_id"],
+                                )
                             return
 
                         if message.document and message.document.file_name.lower().endswith('.pdf'):
@@ -826,6 +831,7 @@ class FileDistributionBot:
                                     sender,
                                     doc_name,
                                     sent_from_account="НИК-2",
+                                    reply_chat_id=getattr(getattr(message, "chat", None), "id", None),
                                 )
                                 if matched_info is None:
                                     print(
@@ -837,8 +843,11 @@ class FileDistributionBot:
                                         f"ℹ️ PDF от редактора {sender} привязан без reply: "
                                         f"{doc_name} -> {tracking_key} ({reason})"
                                     )
-                                    message.reply_to_message_id = matched_info["reply_to_message_id"]
-                                    await self.handlers.handle_editor_response(client, message)
+                                    await self.handlers.handle_editor_response(
+                                        client,
+                                        message,
+                                        resolved_reply_to_message_id=matched_info["reply_to_message_id"],
+                                    )
 
                 normal_accounts = settings.get("normal_accounts") or []
                 if nickname in normal_accounts:

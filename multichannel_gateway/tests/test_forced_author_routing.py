@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -1385,6 +1386,335 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
             {"анти курсовая.pdf", "ии анти курсовая.pdf"},
             tracking["delivered_reports"],
         )
+
+    async def test_full_fixed_editor_flow_accepts_two_unreplied_reports_without_mutating_message(self):
+        task = telegram_file_info(
+            "ordinary",
+            42,
+            "курсовая работа.docx",
+            chat_id=-100123,
+            message_id=777,
+        )
+        settings = base_settings(
+            [],
+            telegram_group_routes={
+                "-100123": {
+                    "title": "Компания",
+                    "destination": "editor",
+                    "editor_nickname": "@fixed-editor",
+                }
+            },
+        )
+        sent = [SimpleNamespace(id=300330, chat=SimpleNamespace(id=301))]
+        handlers, nik1, _nik2 = await self._make_handlers_with_tasks([task], sent, settings)
+        tracking_key, tracking = next(iter(handlers.editor_tracking.items()))
+        handlers._increment_files_today("telegram")
+        source_count = handlers.files_today["count"]
+
+        class PyrogramLikeMessage(SimpleNamespace):
+            async def download(self, path):
+                if not hasattr(self, "_client"):
+                    raise AssertionError("download must use the original Pyrogram message")
+                Path(path).write_bytes(self.payload)
+                return path
+
+        normal = PyrogramLikeMessage(
+            id=7001,
+            _client=object(),
+            reply_to_message_id=None,
+            document=SimpleNamespace(file_name="курсовая работа.pdf"),
+            chat=SimpleNamespace(id=301),
+            from_user=SimpleNamespace(username="fixed-editor", id=9000),
+            payload=b"normal",
+        )
+        ai = PyrogramLikeMessage(
+            id=7002,
+            _client=object(),
+            reply_to_message_id=None,
+            document=SimpleNamespace(file_name="ИИ курсовая работа.pdf"),
+            chat=SimpleNamespace(id=301),
+            from_user=SimpleNamespace(username="fixed-editor", id=9000),
+            payload=b"ai",
+        )
+        client = SimpleNamespace(name="НИК-2")
+
+        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)), patch(
+            "os.remove"
+        ), patch("os.path.exists", return_value=True), patch("builtins.print") as print_mock:
+            await handlers.handle_editor_response(client, normal)
+            await handlers.handle_editor_response(client, ai)
+            await handlers.handle_editor_response(client, normal)
+
+        self.assertIsNone(normal.reply_to_message_id)
+        self.assertIsNone(ai.reply_to_message_id)
+        self.assertEqual(2, nik1.send_document.await_count)
+        self.assertEqual(
+            ["курсовая работа.pdf", "ИИ курсовая работа.pdf"],
+            [call.kwargs["file_name"] for call in nik1.send_document.await_args_list],
+        )
+        self.assertEqual(
+            [-100123, -100123],
+            [call.kwargs["chat_id"] for call in nik1.send_document.await_args_list],
+        )
+        self.assertEqual(
+            [777, 777],
+            [call.kwargs["reply_to_message_id"] for call in nik1.send_document.await_args_list],
+        )
+        self.assertEqual(
+            {"курсовая работа.pdf", "ии курсовая работа.pdf"},
+            tracking["delivered_reports"],
+        )
+        self.assertIn(tracking_key, handlers.editor_tracking)
+        self.assertEqual(source_count, handlers.files_today["count"])
+        self.assertEqual(
+            [],
+            [
+                call_args
+                for call_args in print_mock.call_args_list
+                if "Не найдена информация об отправке" in str(call_args)
+            ],
+        )
+
+    async def test_editor_response_download_failure_releases_claim_for_retry(self):
+        task = telegram_file_info(
+            "ordinary",
+            42,
+            "курсовая работа.docx",
+            chat_id=-100123,
+            message_id=777,
+        )
+        settings = base_settings(
+            [],
+            telegram_group_routes={
+                "-100123": {
+                    "title": "Компания",
+                    "destination": "editor",
+                    "editor_nickname": "@fixed-editor",
+                }
+            },
+        )
+        sent = [SimpleNamespace(id=300330, chat=SimpleNamespace(id=301))]
+        handlers, nik1, _nik2 = await self._make_handlers_with_tasks([task], sent, settings)
+        result_path = Path(tempfile.gettempdir()) / "retry-editor-response.pdf"
+        result_path.write_bytes(b"normal")
+        message = SimpleNamespace(
+            id=7003,
+            reply_to_message_id=None,
+            document=SimpleNamespace(file_name="курсовая работа.pdf"),
+            chat=SimpleNamespace(id=301),
+            from_user=SimpleNamespace(username="fixed-editor", id=9000),
+        )
+        attempts = 0
+
+        async def download(path):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary download failure")
+            Path(path).write_bytes(result_path.read_bytes())
+            return path
+
+        message.download = download
+        client = SimpleNamespace(name="НИК-2")
+
+        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)), patch(
+            "os.remove"
+        ), patch("os.path.exists", return_value=True):
+            await handlers.handle_editor_response(client, message)
+            self.assertEqual(0, nik1.send_document.await_count)
+            await handlers.handle_editor_response(client, message)
+
+        self.assertEqual(2, attempts)
+        self.assertEqual(1, nik1.send_document.await_count)
+
+    async def test_durable_spool_is_claimed_once_as_editor_response(self):
+        task = telegram_file_info(
+            "ordinary",
+            42,
+            "курсовая работа.docx",
+            chat_id=-100123,
+            message_id=777,
+        )
+        settings = base_settings(
+            [],
+            telegram_group_routes={
+                "-100123": {
+                    "title": "Компания",
+                    "destination": "editor",
+                    "editor_nickname": "@fixed-editor",
+                }
+            },
+        )
+        sent = [SimpleNamespace(id=300330, chat=SimpleNamespace(id=301))]
+        handlers, _nik1, _nik2 = await self._make_handlers_with_tasks([task], sent, settings)
+        message = SimpleNamespace(
+            id=7006,
+            reply_to_message_id=300330,
+            document=SimpleNamespace(file_name="курсовая работа.pdf"),
+            chat=SimpleNamespace(id=301),
+            from_user=SimpleNamespace(username="fixed-editor", id=9000),
+        )
+
+        async def download(path):
+            Path(path).write_bytes(b"normal")
+            return path
+
+        message.download = download
+        handlers._deliver_document_to_origin = AsyncMock(
+            return_value={"status": "spooled", "outbox_id": "editor-result-1"}
+        )
+        client = SimpleNamespace(name="НИК-2")
+
+        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)), patch(
+            "os.remove"
+        ), patch("os.path.exists", return_value=True):
+            await handlers.handle_editor_response(client, message)
+            await handlers.handle_editor_response(client, message)
+
+        self.assertEqual(1, handlers._deliver_document_to_origin.await_count)
+        tracking = next(iter(handlers.editor_tracking.values()))
+        self.assertEqual({"курсовая работа.pdf"}, tracking["delivered_reports"])
+
+    async def test_duplicate_incoming_editor_message_is_delivered_once(self):
+        task = telegram_file_info(
+            "ordinary",
+            42,
+            "курсовая работа.docx",
+            chat_id=-100123,
+            message_id=777,
+        )
+        settings = base_settings(
+            [],
+            telegram_group_routes={
+                "-100123": {
+                    "title": "Компания",
+                    "destination": "editor",
+                    "editor_nickname": "@fixed-editor",
+                }
+            },
+        )
+        sent = [SimpleNamespace(id=300330, chat=SimpleNamespace(id=301))]
+        handlers, nik1, _nik2 = await self._make_handlers_with_tasks([task], sent, settings)
+        message = SimpleNamespace(
+            id=7004,
+            reply_to_message_id=300330,
+            document=SimpleNamespace(file_name="курсовая работа.pdf"),
+            chat=SimpleNamespace(id=301),
+            from_user=SimpleNamespace(username="fixed-editor", id=9000),
+        )
+
+        async def download(path):
+            await asyncio.sleep(0)
+            Path(path).write_bytes(b"normal")
+            return path
+
+        async def deliver(*args, **kwargs):
+            await asyncio.sleep(0)
+            return {"status": "sent"}
+
+        message.download = download
+        handlers._deliver_document_to_origin = AsyncMock(side_effect=deliver)
+        client = SimpleNamespace(name="НИК-2")
+
+        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)), patch(
+            "os.remove"
+        ), patch("os.path.exists", return_value=True):
+            await asyncio.gather(
+                handlers.handle_editor_response(client, message),
+                handlers.handle_editor_response(client, message),
+            )
+
+        self.assertEqual(1, handlers._deliver_document_to_origin.await_count)
+
+    async def test_unknown_editor_reply_is_logged_once_without_filename_fallback(self):
+        handlers = make_handlers()
+        handlers.editor_tracking["fixed_editor_301_300330"] = {
+            "author": "ordinary",
+            "original_name": "курсовая работа.docx",
+            "expected_pdf_name": "курсовая работа.pdf",
+            "expected_ai_pdf_name": "ИИ курсовая работа.pdf",
+            "destination": "@fixed-editor",
+            "sent_from_account": "НИК-2",
+            "reply_to_message_id": 300330,
+            "chat_id": 301,
+            "fixed_author_editor_route": True,
+            "delivered_reports": set(),
+        }
+        message = SimpleNamespace(
+            id=7005,
+            reply_to_message_id=300329,
+            document=SimpleNamespace(file_name="курсовая работа.pdf"),
+            chat=SimpleNamespace(id=301),
+            from_user=SimpleNamespace(username="fixed-editor", id=9000),
+        )
+        client = SimpleNamespace(name="НИК-2")
+
+        with patch("builtins.print") as print_mock:
+            await handlers.handle_editor_response(client, message)
+            await handlers.handle_editor_response(client, message)
+
+        warnings = [
+            call_args
+            for call_args in print_mock.call_args_list
+            if "Не найдена информация об отправке" in str(call_args)
+        ]
+        self.assertEqual(1, len(warnings))
+
+    async def test_completed_fixed_task_is_not_a_filename_candidate_for_next_same_named_task(self):
+        handlers = make_handlers()
+        handlers.editor_tracking = {
+            "fixed_editor_301_300329": {
+                "original_name": "курсовая работа.docx",
+                "expected_pdf_name": "курсовая работа.pdf",
+                "expected_ai_pdf_name": "ИИ курсовая работа.pdf",
+                "destination": "@fixed-editor",
+                "sent_from_account": "НИК-2",
+                "reply_to_message_id": 300329,
+                "chat_id": 301,
+                "fixed_author_editor_route": True,
+                "delivered_reports": {"курсовая работа.pdf", "ии курсовая работа.pdf"},
+            },
+            "fixed_editor_301_300330": {
+                "original_name": "курсовая работа.docx",
+                "expected_pdf_name": "курсовая работа.pdf",
+                "expected_ai_pdf_name": "ИИ курсовая работа.pdf",
+                "destination": "@fixed-editor",
+                "sent_from_account": "НИК-2",
+                "reply_to_message_id": 300330,
+                "chat_id": 301,
+                "fixed_author_editor_route": True,
+                "delivered_reports": set(),
+            },
+        }
+
+        key, info, reason = handlers.find_editor_tracking_for_unreplied_pdf(
+            "fixed-editor",
+            "курсовая работа.pdf",
+            reply_chat_id=301,
+        )
+
+        self.assertEqual("fixed_editor_301_300330", key)
+        self.assertEqual(300330, info["reply_to_message_id"])
+        self.assertIn("точное совпадение", reason)
+
+    async def test_editor_response_claims_expire_without_unbounded_growth(self):
+        handlers = make_handlers()
+        now = datetime.now()
+        handlers._editor_response_claims = {
+            ("301", "old"): now - timedelta(hours=25),
+            ("301", "fresh"): now,
+        }
+        handlers._editor_response_unknown_warnings = {
+            ("301", "old-warning"): now - timedelta(hours=25),
+            ("301", "fresh-warning"): now,
+        }
+
+        handlers._cleanup_editor_response_state(now)
+
+        self.assertNotIn(("301", "old"), handlers._editor_response_claims)
+        self.assertIn(("301", "fresh"), handlers._editor_response_claims)
+        self.assertNotIn(("301", "old-warning"), handlers._editor_response_unknown_warnings)
+        self.assertIn(("301", "fresh-warning"), handlers._editor_response_unknown_warnings)
 
     async def test_two_group_routes_use_different_editors_for_same_named_files(self):
         tasks = [
