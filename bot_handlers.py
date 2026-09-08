@@ -2856,6 +2856,34 @@ class BotHandlers:
         delivered_reports = tracking_info.get("delivered_reports") or set()
         return self._editor_report_key(file_name) not in delivered_reports
 
+    def _editor_tracking_is_recently_completed(self, tracking_info: dict, now=None) -> bool:
+        if not tracking_info.get("fixed_author_editor_route"):
+            return False
+        sent_at = tracking_info.get("sent_at")
+        if not isinstance(sent_at, datetime):
+            return False
+        current_time = now or datetime.now()
+        try:
+            age = current_time - sent_at
+        except TypeError:
+            return False
+        if age < timedelta(0) or age > timedelta(hours=24):
+            return False
+        expected_reports = {
+            self._editor_report_key(name)
+            for name in (
+                tracking_info.get("expected_pdf_name"),
+                tracking_info.get("expected_ai_pdf_name"),
+            )
+            if name
+        }
+        delivered_reports = {
+            self._editor_report_key(name)
+            for name in (tracking_info.get("delivered_reports") or set())
+            if name
+        }
+        return bool(expected_reports) and expected_reports.issubset(delivered_reports)
+
     def _find_editor_tracking_by_reply(self, reply_to_message_id, chat_id=None, sent_from_account="НИК-2"):
         if not reply_to_message_id:
             return None, None
@@ -2952,7 +2980,25 @@ class BotHandlers:
             if self._editor_tracking_matches_file(doc_name, info)
         ]
         if len(matches) == 1:
-            return matches[0][0], matches[0][1], "точное совпадение имени файла"
+            matched_key, matched_info = matches[0]
+            sender_clean = str(sender or "").replace("@", "").lower()
+            completed_conflicts = [
+                info
+                for key, info in self.editor_tracking.items()
+                if key != matched_key
+                and self._editor_tracking_is_recently_completed(info)
+                and info.get("sent_from_account") == sent_from_account
+                and str(info.get("destination", "")).replace("@", "").lower() == sender_clean
+                and (
+                    reply_chat_id is None
+                    or info.get("chat_id") is None
+                    or str(info.get("chat_id")) == str(reply_chat_id)
+                )
+                and self._editor_tracking_matches_file(doc_name, info)
+            ]
+            if completed_conflicts:
+                return None, None, f"неоднозначное имя файла: {doc_name} (есть недавно завершенная задача)"
+            return matched_key, matched_info, "точное совпадение имени файла"
         if len(matches) > 1:
             return None, None, f"неоднозначное имя файла: {doc_name}"
         return None, None, f"нет точного совпадения имени файла: {doc_name}"
@@ -3919,12 +3965,13 @@ class BotHandlers:
             if tracking_info or message.reply_to_message_id in self.editor_tracking:
                 print(f"✅ Получен ожидаемый ответ от редактора {author}")
                 await self.handle_editor_response(client, message)
-            elif getattr(client, "name", None) == "НИК-2" and message.document and message.document.file_name.lower().endswith(".pdf"):
-                self._warn_unknown_editor_response(message, message.reply_to_message_id)
-            return
+            elif getattr(client, "name", None) == "НИК-2":
+                if message.document and message.document.file_name.lower().endswith(".pdf"):
+                    self._warn_unknown_editor_response(message, message.reply_to_message_id)
+                return
 
         # Проверяем по отправителю и формату файла
-        if message.document and message.document.file_name.lower().endswith('.pdf'):
+        if not message.reply_to_message_id and message.document and message.document.file_name.lower().endswith('.pdf'):
             tracking_key, tracking_info, match_reason = self.find_editor_tracking_for_unreplied_pdf(
                 author,
                 message.document.file_name,
@@ -5254,7 +5301,10 @@ class BotHandlers:
                     )
                     spooled = isinstance(delivery, dict) and delivery.get("status") == "spooled"
                     sent_ok = not spooled
-                    delivery_accepted = sent_ok or spooled
+                    delivery_accepted = sent_ok or (
+                        spooled
+                        and str(tracking_info.get("source_platform") or "telegram").lower() != "telegram"
+                    )
                     if sent_ok:
                         print("✅ PDF от редактора доставлен в исходный канал", flush=True)
                         self._log_editor("✅ PDF от редактора доставлен в исходный канал")
@@ -5303,7 +5353,10 @@ class BotHandlers:
                     )
                     spooled = isinstance(delivery, dict) and delivery.get("status") == "spooled"
                     sent_ok = not spooled
-                    delivery_accepted = sent_ok or spooled
+                    delivery_accepted = sent_ok or (
+                        spooled
+                        and str(tracking_info.get("source_platform") or "telegram").lower() != "telegram"
+                    )
                     if sent_ok:
                         print(f"✅ PDF от редактора доставлен: {tracking_info['author']}")
                         self._log_editor(f"✅ PDF от редактора доставлен: {tracking_info['author']}")

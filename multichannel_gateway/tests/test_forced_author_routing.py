@@ -1527,7 +1527,7 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, attempts)
         self.assertEqual(1, nik1.send_document.await_count)
 
-    async def test_durable_spool_is_claimed_once_as_editor_response(self):
+    async def test_telegram_spool_is_not_accepted_and_same_editor_message_can_retry(self):
         task = telegram_file_info(
             "ordinary",
             42,
@@ -1561,19 +1561,30 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
 
         message.download = download
         handlers._deliver_document_to_origin = AsyncMock(
-            return_value={"status": "spooled", "outbox_id": "editor-result-1"}
+            side_effect=[
+                {"status": "spooled", "outbox_id": "editor-result-1"},
+                {"status": "sent"},
+            ]
         )
+        handlers._finish_processing = MagicMock()
         client = SimpleNamespace(name="НИК-2")
 
         with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)), patch(
             "os.remove"
         ), patch("os.path.exists", return_value=True):
             await handlers.handle_editor_response(client, message)
+            tracking = next(iter(handlers.editor_tracking.values()))
+            self.assertEqual(set(), tracking["delivered_reports"])
+            self.assertNotIn(("301", "7006"), handlers._editor_response_claims)
+            handlers._finish_processing.assert_called_once_with(tracking["file_uid"], False)
             await handlers.handle_editor_response(client, message)
 
-        self.assertEqual(1, handlers._deliver_document_to_origin.await_count)
-        tracking = next(iter(handlers.editor_tracking.values()))
+        self.assertEqual(2, handlers._deliver_document_to_origin.await_count)
         self.assertEqual({"курсовая работа.pdf"}, tracking["delivered_reports"])
+        self.assertIn(("301", "7006"), handlers._editor_response_claims)
+        self.assertEqual(2, handlers._finish_processing.call_count)
+        handlers._finish_processing.assert_any_call(tracking["file_uid"], False)
+        handlers._finish_processing.assert_called_with(tracking["file_uid"], True)
 
     async def test_duplicate_incoming_editor_message_is_delivered_once(self):
         task = telegram_file_info(
@@ -1673,6 +1684,7 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
                 "chat_id": 301,
                 "fixed_author_editor_route": True,
                 "delivered_reports": {"курсовая работа.pdf", "ии курсовая работа.pdf"},
+                "sent_at": datetime.now(),
             },
             "fixed_editor_301_300330": {
                 "original_name": "курсовая работа.docx",
@@ -1684,6 +1696,7 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
                 "chat_id": 301,
                 "fixed_author_editor_route": True,
                 "delivered_reports": set(),
+                "sent_at": datetime.now(),
             },
         }
 
@@ -1693,9 +1706,57 @@ class TestEditorReportsForFixedRoute(unittest.IsolatedAsyncioTestCase):
             reply_chat_id=301,
         )
 
+        self.assertIsNone(key)
+        self.assertIsNone(info)
+        self.assertIn("неоднозначное", reason)
+
+        handlers._deliver_document_to_origin = AsyncMock()
+        late_message = SimpleNamespace(
+            id=7007,
+            reply_to_message_id=None,
+            document=SimpleNamespace(file_name="курсовая работа.pdf"),
+            chat=SimpleNamespace(id=301),
+            from_user=SimpleNamespace(username="fixed-editor", id=9000),
+        )
+        with patch("builtins.print"):
+            await handlers.handle_editor_response(SimpleNamespace(name="НИК-2"), late_message)
+
+        handlers._deliver_document_to_origin.assert_not_awaited()
+        self.assertIn("fixed_editor_301_300330", handlers.editor_tracking)
+
+    async def test_explicit_reply_selects_active_same_named_task_after_completed_task(self):
+        handlers = make_handlers()
+        handlers.editor_tracking = {
+            "fixed_editor_301_300329": {
+                "original_name": "курсовая работа.docx",
+                "expected_pdf_name": "курсовая работа.pdf",
+                "expected_ai_pdf_name": "ИИ курсовая работа.pdf",
+                "destination": "@fixed-editor",
+                "sent_from_account": "НИК-2",
+                "reply_to_message_id": 300329,
+                "chat_id": 301,
+                "fixed_author_editor_route": True,
+                "delivered_reports": {"курсовая работа.pdf", "ии курсовая работа.pdf"},
+                "sent_at": datetime.now(),
+            },
+            "fixed_editor_301_300330": {
+                "original_name": "курсовая работа.docx",
+                "expected_pdf_name": "курсовая работа.pdf",
+                "expected_ai_pdf_name": "ИИ курсовая работа.pdf",
+                "destination": "@fixed-editor",
+                "sent_from_account": "НИК-2",
+                "reply_to_message_id": 300330,
+                "chat_id": 301,
+                "fixed_author_editor_route": True,
+                "delivered_reports": set(),
+                "sent_at": datetime.now(),
+            },
+        }
+
+        key, info = handlers._find_editor_tracking_by_reply(300330, chat_id=301)
+
         self.assertEqual("fixed_editor_301_300330", key)
         self.assertEqual(300330, info["reply_to_message_id"])
-        self.assertIn("точное совпадение", reason)
 
     async def test_editor_response_claims_expire_without_unbounded_growth(self):
         handlers = make_handlers()

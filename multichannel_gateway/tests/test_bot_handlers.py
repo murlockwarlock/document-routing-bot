@@ -3604,6 +3604,93 @@ class TestEditorResponseOriginalFilename(unittest.IsolatedAsyncioTestCase):
 
         handlers.handle_editor_response.assert_not_awaited()
 
+    async def test_client_docx_with_unknown_reply_from_nik1_continues_group_routing(self):
+        handlers = _make_handlers()
+        handlers.process_queue = AsyncMock()
+        handlers.manager.get_file_lock = AsyncMock(return_value=asyncio.Lock())
+        handlers.manager.get_file_status = AsyncMock(return_value="NEW")
+        handlers.manager.set_file_status = AsyncMock()
+        handlers.manager.reset_waiting_status = MagicMock()
+        message = SimpleNamespace(
+            id=778,
+            reply_to_message_id=777,
+            document=SimpleNamespace(file_name="ДИПЛОМ.docx", file_size=256),
+            text=None,
+            chat=SimpleNamespace(id=-100123, type="group"),
+            from_user=SimpleNamespace(username="client", id=42),
+        )
+        ingest_job = SimpleNamespace(
+            job_id=78,
+            file_path=__file__,
+            dedupe_key="telegram:-100123:778:0",
+        )
+        settings = {
+            "mode": "mode1",
+            "ai_bot": "@AAA_Report_AIBot",
+            "anti_bot": "@plagiscan_bot",
+            "allowed_authors": [],
+            "telegram_group_routes": {
+                "-100123": {
+                    "title": "Компания",
+                    "destination": "plagiscan",
+                }
+            },
+        }
+
+        with patch("bot_handlers.Config.get_setting", side_effect=lambda key, default=None: settings.get(key, default)), patch(
+            "bot_handlers.ingest_pyrogram_message",
+            new=AsyncMock(return_value=[ingest_job]),
+        ) as ingest_mock:
+            await handlers.handle_main_account(SimpleNamespace(name="НИК-1"), message)
+
+        ingest_mock.assert_awaited_once_with(message)
+        self.assertEqual(1, len(handlers.manager.file_queue))
+        self.assertEqual(-100123, handlers.manager.file_queue[0]["route_chat_id"])
+        self.assertEqual(778, handlers.manager.file_queue[0]["route_message_id"])
+        self.assertEqual(
+            {"destination": "plagiscan", "scope": "telegram_group"},
+            handlers.manager.file_queue[0]["forced_route"],
+        )
+
+    async def test_client_docx_with_unknown_reply_from_nik1_continues_private_routing(self):
+        handlers = _make_handlers()
+        handlers.process_queue = AsyncMock()
+        handlers.manager.get_file_lock = AsyncMock(return_value=asyncio.Lock())
+        handlers.manager.get_file_status = AsyncMock(return_value="NEW")
+        handlers.manager.set_file_status = AsyncMock()
+        handlers.manager.reset_waiting_status = MagicMock()
+        message = SimpleNamespace(
+            id=779,
+            reply_to_message_id=778,
+            document=SimpleNamespace(file_name="ДИПЛОМ.docx", file_size=256),
+            text=None,
+            chat=SimpleNamespace(id=42, type="private"),
+            from_user=SimpleNamespace(username="client", id=42),
+        )
+        ingest_job = SimpleNamespace(
+            job_id=79,
+            file_path=__file__,
+            dedupe_key="telegram:42:779:0",
+        )
+        settings = {
+            "mode": "mode1",
+            "ai_bot": "@AAA_Report_AIBot",
+            "anti_bot": "@plagaiscan_bot",
+            "allowed_authors": ["client"],
+            "telegram_group_routes": {},
+        }
+
+        with patch("bot_handlers.Config.get_setting", side_effect=lambda key, default=None: settings.get(key, default)), patch(
+            "bot_handlers.ingest_pyrogram_message",
+            new=AsyncMock(return_value=[ingest_job]),
+        ) as ingest_mock:
+            await handlers.handle_main_account(SimpleNamespace(name="НИК-1"), message)
+
+        ingest_mock.assert_awaited_once_with(message)
+        self.assertEqual(1, len(handlers.manager.file_queue))
+        self.assertEqual(42, handlers.manager.file_queue[0]["route_chat_id"])
+        self.assertIsNone(handlers.manager.file_queue[0]["forced_route"])
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Counter report format — период, анти/обычные, НЕ ПРИСЛАННЫЕ
