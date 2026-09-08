@@ -813,6 +813,11 @@ class Config:
             routes = {}
         changed = False
 
+        def show_saved_routes(prompt, saved_routes):
+            print(prompt)
+            for index, (_, route) in enumerate(saved_routes, 1):
+                print(f"{index}. {route.get('title', 'Без названия')} → {cls._group_route_label(route)}")
+
         while True:
             print("\n" + "-" * 30)
             print("💬 TELEGRAM-БЕСЕДЫ")
@@ -841,6 +846,7 @@ class Config:
                     print("⚠️ Нет настроенных бесед для изменения.")
                     continue
                 saved = list(routes.items())
+                show_saved_routes("\nВыберите беседу для изменения:", saved)
                 selected = input("Номер беседы [Enter — назад]: ").strip()
                 if not selected:
                     continue
@@ -861,13 +867,18 @@ class Config:
                     print("⚠️ Нет настроенных бесед для удаления.")
                     continue
                 saved = list(routes.items())
+                show_saved_routes("\nВыберите беседу для удаления:", saved)
                 selected = input("Номер беседы для удаления [Enter — назад]: ").strip()
                 if not selected:
                     continue
                 try:
-                    chat_id, _ = saved[int(selected) - 1]
+                    chat_id, route = saved[int(selected) - 1]
                 except (TypeError, ValueError, IndexError):
                     print("❌ Неверный выбор")
+                    continue
+                title = route.get("title", "Без названия")
+                confirmation = input(f"Удалить беседу «{title}»? [y/N]: ").strip().lower()
+                if confirmation != "y":
                     continue
                 del routes[chat_id]
                 changed = True

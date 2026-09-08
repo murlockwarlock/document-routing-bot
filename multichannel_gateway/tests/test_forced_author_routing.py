@@ -690,6 +690,44 @@ class TestForcedAuthorRouting(unittest.TestCase):
         finally:
             Config._SETTINGS = old_settings
 
+    def test_group_menu_change_lists_saved_routes_and_uses_selected_number(self):
+        old_settings = Config._SETTINGS
+        try:
+            Config._SETTINGS = {
+                "telegram_group_routes": {
+                    "-100123": {
+                        "title": "Первая компания",
+                        "destination": "editor",
+                        "editor_nickname": "@first-editor",
+                    },
+                    "-100124": {
+                        "title": "Вторая компания",
+                        "destination": "editor",
+                        "editor_nickname": "@second-editor",
+                    },
+                }
+            }
+            dialogs = [
+                {"chat_id": "-100123", "title": "Первая компания", "chat_type": "group"},
+                {"chat_id": "-100124", "title": "Вторая компания", "chat_type": "supergroup"},
+            ]
+            with patch.object(Config, "get_telegram_group_dialogs", new=AsyncMock(return_value=dialogs)), patch.object(
+                Config, "save_config"
+            ) as save_config, patch(
+                "builtins.input", side_effect=["2", "2", "1", "4"]
+            ), patch("builtins.print") as print_mock:
+                asyncio.run(Config.setup_telegram_group_routes_interactive())
+
+            output = " ".join(str(call_item) for call_item in print_mock.call_args_list)
+            self.assertIn("Выберите беседу для изменения:", output)
+            self.assertIn("1. Первая компания → редактор @first-editor", output)
+            self.assertIn("2. Вторая компания → редактор @second-editor", output)
+            self.assertEqual("editor", Config.get_setting("telegram_group_routes")["-100123"]["destination"])
+            self.assertEqual("plagiscan", Config.get_setting("telegram_group_routes")["-100124"]["destination"])
+            save_config.assert_called_once()
+        finally:
+            Config._SETTINGS = old_settings
+
     def test_group_menu_searches_case_insensitively_after_ten_dialogs(self):
         old_settings = Config._SETTINGS
         try:
@@ -732,11 +770,14 @@ class TestForcedAuthorRouting(unittest.TestCase):
                 new=AsyncMock(return_value=[{"chat_id": "-100123", "title": "Компания Альфа", "chat_type": "group"}]),
             ), patch.object(Config, "save_config") as save_config, patch(
                 "builtins.input", side_effect=["2", "", "3", "", "4"]
-            ):
+            ), patch("builtins.print") as print_mock:
                 asyncio.run(Config.setup_telegram_group_routes_interactive())
 
             self.assertEqual(saved_route, Config.get_setting("telegram_group_routes"))
             save_config.assert_not_called()
+            output = " ".join(str(call_item) for call_item in print_mock.call_args_list)
+            self.assertIn("Выберите беседу для изменения:", output)
+            self.assertIn("Выберите беседу для удаления:", output)
         finally:
             Config._SETTINGS = old_settings
 
@@ -773,18 +814,53 @@ class TestForcedAuthorRouting(unittest.TestCase):
         try:
             Config._SETTINGS = {
                 "telegram_group_routes": {
-                    "-100123": {"title": "Компания", "destination": "plagiscan"}
+                    "-100123": {"title": "Первая компания", "destination": "plagiscan"},
+                    "-100124": {"title": "Вторая компания", "destination": "plagiscan"},
                 }
             }
             with patch.object(Config, "save_config") as save_config, patch(
-                "builtins.input", side_effect=["3", "1", "4"]
+                "builtins.input", side_effect=["3", "2", "y", "4"]
+            ), patch("builtins.print") as print_mock:
+                asyncio.run(Config.setup_telegram_group_routes_interactive())
+
+            self.assertEqual(
+                {"-100123": {"title": "Первая компания", "destination": "plagiscan"}},
+                Config.get_setting("telegram_group_routes"),
+            )
+            save_config.assert_called_once()
+            output = " ".join(str(call_item) for call_item in print_mock.call_args_list)
+            self.assertIn("Выберите беседу для удаления:", output)
+            self.assertIn("1. Первая компания → Plagiscan", output)
+            self.assertIn("2. Вторая компания → Plagiscan", output)
+        finally:
+            Config._SETTINGS = old_settings
+
+    def test_group_menu_delete_enter_does_not_remove_saved_route(self):
+        old_settings = Config._SETTINGS
+        try:
+            saved_routes = {
+                "-100123": {"title": "Компания", "destination": "plagiscan"}
+            }
+            Config._SETTINGS = {"telegram_group_routes": saved_routes}
+            with patch.object(Config, "save_config") as save_config, patch(
+                "builtins.input", side_effect=["3", "1", "", "4"]
             ):
                 asyncio.run(Config.setup_telegram_group_routes_interactive())
 
-            self.assertEqual({}, Config.get_setting("telegram_group_routes"))
-            save_config.assert_called_once()
+            self.assertEqual(saved_routes, Config.get_setting("telegram_group_routes"))
+            save_config.assert_not_called()
         finally:
             Config._SETTINGS = old_settings
+
+    def test_main_menu_places_group_settings_at_seven_and_exit_at_eight(self):
+        from main import ConsoleMenu
+
+        with patch("builtins.print") as print_mock:
+            ConsoleMenu.show_main_menu()
+
+        output = " ".join(str(call_item) for call_item in print_mock.call_args_list)
+        self.assertIn("7. 💬 Настроить Telegram-беседы", output)
+        self.assertIn("8. ❌ Выйти", output)
 
     def test_old_config_loads_and_round_trips_without_manual_new_section(self):
         old_accounts = Config._ACCOUNTS

@@ -118,8 +118,8 @@ class ConsoleMenu:
         print("4. 📋 Показать текущие настройки")
         print("5. 🚀 ЗАПУСТИТЬ БОТА")
         print("6. 🌐 Настроить VK / MAX токены")
-        print("7. ❌ Выйти")
-        print("8. 💬 Настроить Telegram-беседы")
+        print("7. 💬 Настроить Telegram-беседы")
+        print("8. ❌ Выйти")
         print("")
         print("Версия: 1.8")
         print("-" * 60)
@@ -1309,13 +1309,13 @@ async def main():
                 print("\n✅ Настройки VK/MAX/Long Poll сохранены в config.json")
                 input("\nНажмите Enter для продолжения...")
 
-            elif choice == '8':
+            elif choice == '7':
                 Config.load_config()
                 await Config.setup_telegram_group_routes_interactive(
                     bot.manager.get_client("НИК-1")
                 )
 
-            elif choice == '7':
+            elif choice == '8':
                 # Выход
                 print("\n👋 До свидания!")
                 if bot.running:
