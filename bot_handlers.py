@@ -1,7 +1,6 @@
 import os
 import re
 import asyncio
-import copy
 import shutil
 import tempfile
 import uuid
@@ -2843,7 +2842,12 @@ class BotHandlers:
         self._editor_response_guard[key] = now
         return True
 
-    def _log_unknown_editor_reply(self, message):
+    def _log_unknown_editor_reply(self, message, reply_to_message_id=None):
+        display_reply_id = (
+            message.reply_to_message_id
+            if reply_to_message_id is None
+            else reply_to_message_id
+        )
         key = self._editor_response_message_key(message)
         if key is not None:
             now = time_module.monotonic()
@@ -2857,7 +2861,12 @@ class BotHandlers:
                 oldest_key = min(self._editor_unknown_reply_guard, key=self._editor_unknown_reply_guard.get)
                 del self._editor_unknown_reply_guard[oldest_key]
             self._editor_unknown_reply_guard[key] = now
-        print(f"⚠️  Не найдена информация об отправке для сообщения {message.reply_to_message_id} в НИК-2")
+        print(f"⚠️  Не найдена информация об отправке для сообщения {display_reply_id} в НИК-2")
+
+    def _release_editor_response(self, message):
+        key = self._editor_response_message_key(message)
+        if key is not None:
+            self._editor_response_guard.pop(key, None)
 
     def _find_editor_tracking_by_reply(self, reply_to_message_id, chat_id=None, sent_from_account="НИК-2"):
         if not reply_to_message_id:
@@ -3871,13 +3880,16 @@ class BotHandlers:
                 reply_chat_id=getattr(getattr(message, "chat", None), "id", None),
             )
             if tracking_key:
-                response_message = message
-                if not message.reply_to_message_id and tracking_info.get("reply_to_message_id"):
-                    response_message = copy.copy(message)
-                    response_message.reply_to_message_id = tracking_info.get("reply_to_message_id")
                 print(f"\n📨 Новое сообщение от {author}")
                 print(f"✅ Получен ожидаемый текстовый ответ от редактора {author} ({match_reason})")
-                await self.handle_editor_response(client, response_message)
+                if message.reply_to_message_id:
+                    await self.handle_editor_response(client, message)
+                else:
+                    await self.handle_editor_response(
+                        client,
+                        message,
+                        resolved_reply_to_message_id=tracking_info.get("reply_to_message_id"),
+                    )
             elif self.is_bot_message(author):
                 print(f"\n📨 Новое сообщение от {author}")
                 await self.handle_bot_response(client, message)
@@ -3914,9 +3926,11 @@ class BotHandlers:
             )
             if tracking_info:
                 print(f"✅ Обнаружен PDF файл от ожидаемого редактора {author} ({match_reason})")
-                response_message = copy.copy(message)
-                response_message.reply_to_message_id = tracking_info.get("reply_to_message_id")
-                await self.handle_editor_response(client, response_message)
+                await self.handle_editor_response(
+                    client,
+                    message,
+                    resolved_reply_to_message_id=tracking_info.get("reply_to_message_id"),
+                )
                 return
             if tracking_key is None and "нет ожидающих задач" not in str(match_reason):
                 print(f"⚠️ PDF от редактора {author} не привязан: {message.document.file_name}, {match_reason}")
@@ -5027,8 +5041,15 @@ class BotHandlers:
             self._log_editor(f"❌ Ошибка при перенаправлении через НИК-2: {e}")
             self.processor.cleanup_temp_files(temp_files_to_cleanup)
 
-    async def handle_editor_response(self, client, message):
+    async def handle_editor_response(self, client, message, resolved_reply_to_message_id=None):
         """Обработка ответов от редактора (PDF файлов) для НИК-2"""
+        effective_reply_to_message_id = (
+            message.reply_to_message_id
+            if resolved_reply_to_message_id is None
+            else resolved_reply_to_message_id
+        )
+        response_claimed = False
+        delivery_succeeded = False
         try:
             if self._editor_response_was_claimed(message):
                 return
@@ -5036,24 +5057,24 @@ class BotHandlers:
             # Проверяем, что это сообщение от НИК-2
             if client.name != "НИК-2":
                 # Если это не НИК-2, проверяем стандартное отслеживание
-                tracking_info = self.editor_tracking.get(message.reply_to_message_id)
+                tracking_info = self.editor_tracking.get(effective_reply_to_message_id)
                 if not tracking_info:
                     return
             else:
                 # Для НИК-2 ищем tracking по специальному ключу
                 tracking_key, tracking_info = self._find_editor_tracking_by_reply(
-                    message.reply_to_message_id,
+                    effective_reply_to_message_id,
                     chat_id=getattr(getattr(message, "chat", None), "id", None),
                 )
 
                 if not tracking_info:
-                    self._log_unknown_editor_reply(message)
+                    self._log_unknown_editor_reply(message, effective_reply_to_message_id)
                     return
 
-            print(f"\n📨 Ответ от редактора на сообщение {message.reply_to_message_id}")
+            print(f"\n📨 Ответ от редактора на сообщение {effective_reply_to_message_id}")
             print(f"📄 Тип файла: {'АНТИ' if tracking_info.get('is_anti_file') else 'Обычный'}")
             print(f"👤 Получено в аккаунте: {client.name}")
-            self._log_editor(f"📨 Ответ от редактора на сообщение {message.reply_to_message_id} | account={client.name} file={tracking_info.get('original_name')}")
+            self._log_editor(f"📨 Ответ от редактора на сообщение {effective_reply_to_message_id} | account={client.name} file={tracking_info.get('original_name')}")
 
             # Проверяем, что редактор отправил документ
             if not message.document:
@@ -5116,7 +5137,7 @@ class BotHandlers:
             self._log_editor(f"✅ Редактор вернул PDF: {file_name}")
 
             if not self._editor_tracking_matches_file(file_name, tracking_info):
-                if message.reply_to_message_id:
+                if effective_reply_to_message_id:
                     print(
                         f"⚠️  PDF от редактора не отправлен: имя {file_name} "
                         "не соответствует задаче из reply"
@@ -5156,6 +5177,7 @@ class BotHandlers:
                 return
             if not self._claim_editor_response(message):
                 return
+            response_claimed = True
 
             # Редакторский PDF отправляем с тем именем, которое вернул редактор.
             deliver_file_name = file_name
@@ -5166,6 +5188,8 @@ class BotHandlers:
                 client_nik1 = self.manager.get_client("НИК-1")
                 if not client_nik1:
                     print("❌ Аккаунт НИК-1 не найден для отправки автору")
+                    self._release_editor_response(message)
+                    response_claimed = False
                     return
 
                 # Скачиваем файл (используем реальный путь от Pyrogram)
@@ -5177,6 +5201,8 @@ class BotHandlers:
 
                 if not os.path.exists(temp_path):
                     print(f"❌ Файл не скачался: {temp_path}", flush=True)
+                    self._release_editor_response(message)
+                    response_claimed = False
                     return
                 sent_ok = False
                 try:
@@ -5201,6 +5227,10 @@ class BotHandlers:
                     traceback.print_exc()
                 if not sent_ok:
                     print("❌ PDF не доставлен — все попытки исчерпаны", flush=True)
+                    self._release_editor_response(message)
+                    response_claimed = False
+                else:
+                    delivery_succeeded = True
 
                 print(f"📁 Файл: {deliver_file_name} ({'обрезан' if tracking_info.get('is_anti_file') else 'без обрезки'})", flush=True)
                 self._finish_processing(tracking_info.get("file_uid"), sent_ok)
@@ -5219,6 +5249,8 @@ class BotHandlers:
                 # Fix #3: проверка успешного скачивания
                 if not os.path.exists(temp_path):
                     print(f"❌ Файл не скачался: {temp_path}", flush=True)
+                    self._release_editor_response(message)
+                    response_claimed = False
                     return
 
                 sent_ok = False
@@ -5245,6 +5277,10 @@ class BotHandlers:
                     traceback.print_exc()
                 if not sent_ok:
                     print("❌ PDF не доставлен (НИК-1) — все попытки исчерпаны", flush=True)
+                    self._release_editor_response(message)
+                    response_claimed = False
+                else:
+                    delivery_succeeded = True
 
                 self._finish_processing(tracking_info.get("file_uid"), sent_ok)
                 if sent_ok and not tracking_info.get("gateway_job_completed"):
@@ -5260,9 +5296,9 @@ class BotHandlers:
                 if tracking_key in self.editor_tracking:
                     del self.editor_tracking[tracking_key]
                     print(f"🗑️  Удален из отслеживания: {tracking_key}")
-            elif not tracking_info.get("fixed_author_editor_route") and message.reply_to_message_id in self.editor_tracking:
-                del self.editor_tracking[message.reply_to_message_id]
-                print(f"🗑️  Удален из отслеживания: {message.reply_to_message_id}")
+            elif not tracking_info.get("fixed_author_editor_route") and effective_reply_to_message_id in self.editor_tracking:
+                del self.editor_tracking[effective_reply_to_message_id]
+                print(f"🗑️  Удален из отслеживания: {effective_reply_to_message_id}")
 
             # Освобождаем аккаунт НИК-2 если он был занят
             if tracking_info.get('sent_from_account') == "НИК-2":
@@ -5290,6 +5326,8 @@ class BotHandlers:
                     self.file_tracking[author]["pending"].remove(tracking_info["original_name"])
 
         except Exception as e:
+            if response_claimed and not delivery_succeeded:
+                self._release_editor_response(message)
             print(f"❌ Ошибка в handle_editor_response: {e}")
             self._log_editor(f"❌ Ошибка в handle_editor_response: {e}")
             import traceback

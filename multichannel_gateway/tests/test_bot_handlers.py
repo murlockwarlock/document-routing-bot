@@ -3541,10 +3541,9 @@ class TestEditorResponseOriginalFilename(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(msg.reply_to_message_id)
         handlers.handle_editor_response.assert_awaited_once()
-        response_message = handlers.handle_editor_response.await_args.args[1]
-        self.assertIsNot(msg, response_message)
         self.assertEqual(client, handlers.handle_editor_response.await_args.args[0])
-        self.assertEqual(705, response_message.reply_to_message_id)
+        self.assertIs(msg, handlers.handle_editor_response.await_args.args[1])
+        self.assertEqual(705, handlers.handle_editor_response.await_args.kwargs["resolved_reply_to_message_id"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
