@@ -3,7 +3,7 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -51,36 +51,23 @@ class ResultSafetyTests(unittest.IsolatedAsyncioTestCase):
             download=download,
         )
 
-    async def verify_history_restart(self, report):
-        old = self.tracking(11)
-        self.h.editor_tracking = {"A": old}
-        delivered_at = time.time() - 25 * 3600
-        with patch("multichannel_gateway.core.storage.time.time", return_value=delivered_at):
-            await self.h.handle_editor_response(self.client, self.response(report))
-        self.assertIn(self.h._editor_report_key(report), old["delivered_reports"])
-        old["sent_at"] -= timedelta(hours=25)
-        self.h.cleanup_old_editor_tracking()
-        self.assertNotIn("A", self.h.editor_tracking)
-        restarted = fixtures.make_handlers()
-        restarted._editor_safety_store = SqliteJobStore(self.root / "jobs.sqlite3")
-        restarted._deliver_document_to_origin = AsyncMock()
-        restarted.editor_tracking = {"B": self.tracking(12)}
-        await restarted.handle_editor_response(self.client, self.response(report, None))
-        restarted._deliver_document_to_origin.assert_not_awaited()
-        for possible_report in ("ДИПЛОМ.pdf", "ИИ ДИПЛОМ.pdf"):
-            self.assertIsNone(restarted.find_editor_tracking_for_unreplied_pdf("editor", possible_report, reply_chat_id=900)[0])
-        self.h.editor_tracking = restarted.editor_tracking
-        self.h._editor_response_claims.clear()
-        self.h._deliver_document_to_origin.reset_mock()
-        await self.h.handle_editor_response(self.client, self.response(report, 12))
-        self.h._deliver_document_to_origin.assert_awaited_once()
-        self.assertEqual(12, self.h._deliver_document_to_origin.await_args.args[0]["route_chat_id"])
-
-    async def test_normal_history_survives_cleanup_and_restart(self):
-        await self.verify_history_restart("ДИПЛОМ.pdf")
-
-    async def test_ai_history_survives_cleanup_and_restart(self):
-        await self.verify_history_restart("ИИ ДИПЛОМ.pdf")
+    async def test_legacy_human_reports_ignore_persisted_history_without_writing_it(self):
+        store = self.h._editor_safety_store
+        for report in ("ДИПЛОМ.pdf", "ИИ ДИПЛОМ.pdf"):
+            store.remember_editor_report("editor", "900", self.h._editor_report_key(report), "old")
+            store.remember_editor_report("*", "*", self.h._editor_report_key(report), "restart")
+        reloaded = SqliteJobStore(store.db_path)
+        self.h._editor_safety_store = reloaded
+        self.h.editor_tracking = {"B": self.tracking(12)}
+        with patch.object(reloaded, "editor_report_conflicts", side_effect=AssertionError("human history read")), patch.object(
+            reloaded, "remember_editor_report", side_effect=AssertionError("human history write"),
+        ):
+            for index, report in enumerate(("ДИПЛОМ.pdf", "ИИ ДИПЛОМ.pdf")):
+                message = self.response(report, None)
+                message.id += index
+                await self.h.handle_editor_response(self.client, message)
+                self.assertEqual(index + 1, self.h._deliver_document_to_origin.await_count)
+                self.assertEqual(12, self.h._deliver_document_to_origin.await_args.args[0]["route_chat_id"])
 
     def test_history_retention_is_independent_and_bounded(self):
         store = self.h._editor_safety_store
@@ -110,13 +97,13 @@ class ResultSafetyTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(editor=editor, chat=chat, report=report, task=task):
                 self.assertFalse(store.editor_report_conflicts(editor, chat, report, task))
 
-    def test_unavailable_history_blocks_filename_correlation(self):
+    def test_unavailable_history_does_not_block_legacy_human_correlation(self):
         self.h.editor_tracking = {"B": self.tracking(12)}
         corrupt = self.root / "corrupt.sqlite3"
         corrupt.write_bytes(b"invalid database")
         self.h._editor_safety_store = None
         with patch("bot_handlers.build_store", side_effect=lambda: SqliteJobStore(corrupt)):
-            self.assertIsNone(self.h.find_editor_tracking_for_unreplied_pdf("editor", "ДИПЛОМ.pdf", reply_chat_id=900)[0])
+            self.assertEqual("B", self.h.find_editor_tracking_for_unreplied_pdf("editor", "ДИПЛОМ.pdf", reply_chat_id=900)[0])
 
     def anti_info(self):
         return dict(

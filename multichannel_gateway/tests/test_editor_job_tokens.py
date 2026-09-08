@@ -236,3 +236,35 @@ class EditorJobTokenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, nik1.send_document.await_count)
         self.assertEqual("ИИ ДИПЛОМ (копия).pdf", nik1.send_document.await_args.kwargs["file_name"])
         self.assertEqual({}, handlers.editor_tracking)
+
+    async def test_ordinary_nik1_text_without_document_is_ignored_safely(self):
+        handlers = fixtures.make_handlers()
+        handlers.handle_editor_response = AsyncMock()
+        handlers.handle_bot_response = AsyncMock()
+        handlers.process_queue = AsyncMock()
+        message = SimpleNamespace(
+            id=901, document=None, text="Добрый день", reply_to_message_id=None,
+            from_user=SimpleNamespace(username="ordinary-client", id=42), chat=SimpleNamespace(id=42),
+        )
+        with patch("bot_handlers.Config.get_setting", side_effect=fixtures.settings_lookup(fixtures.base_settings([]))):
+            await handlers.handle_main_account(SimpleNamespace(name="НИК-1"), message)
+        handlers.handle_editor_response.assert_not_awaited()
+        handlers.handle_bot_response.assert_not_awaited()
+        handlers.process_queue.assert_not_awaited()
+        self.assertEqual({}, handlers.editor_tracking)
+        self.assertEqual([], handlers.manager.file_queue)
+
+    async def test_token_assignment_survives_old_cleanup_until_first_report_then_expires(self):
+        handlers, nik1, nik2 = await self.assignments((101,))
+        key, info = next(iter(handlers.editor_tracking.items()))
+        info["sent_at"] = datetime.now() - timedelta(days=40)
+        handlers.cleanup_old_editor_tracking()
+        self.assertIs(info, handlers.editor_tracking[key])
+        await handlers.handle_editor_response(nik2, self.response())
+        nik1.send_document.assert_awaited_once()
+        handlers.cleanup_old_editor_tracking()
+        self.assertIs(info, handlers.editor_tracking[key])
+        info["first_report_at"] = datetime.now() - timedelta(minutes=31)
+        handlers.cleanup_old_editor_tracking()
+        self.assertNotIn(key, handlers.editor_tracking)
+        self.assertEqual("closed", info["lifecycle"])

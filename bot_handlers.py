@@ -1,5 +1,4 @@
 import os
-import hashlib
 import re
 import asyncio
 import shutil
@@ -3027,16 +3026,6 @@ class BotHandlers:
         }
         return ("ИИ " if ai else "") + original + ".pdf"
 
-    def _editor_safety_context(self, info, file_name):
-        editor = self._normalize_editor_destination(info.get("destination"))
-        chat_id = info.get("chat_id")
-        if not editor or chat_id is None or info.get("reply_to_message_id") is None:
-            raise ValueError("editor safety identity is incomplete")
-        task_key = hashlib.sha256(
-            str((info.get("sent_from_account"), str(chat_id), info["reply_to_message_id"], info.get("file_uid"))).encode()
-        ).hexdigest()
-        return editor, str(chat_id), self._editor_report_key(os.path.splitext(file_name)[0] + ".pdf"), task_key
-
     def _get_editor_safety_store(self):
         if self._editor_safety_store is None:
             self._editor_safety_store = build_store()
@@ -3091,14 +3080,6 @@ class BotHandlers:
             ]
             if completed_conflicts:
                 return None, None, f"неоднозначное имя файла: {doc_name} (есть недавно завершенная задача)"
-            try:
-                if self._get_editor_safety_store().editor_report_conflicts(
-                    *self._editor_safety_context(matched_info, doc_name)
-                ):
-                    return None, None, "неоднозначное имя файла: persistent safety history"
-            except Exception as exc:
-                self._log_editor(f"Filename correlation blocked: safety history unavailable: {exc}")
-                return None, None, "safety history unavailable"
             return matched_key, matched_info, "точное совпадение имени файла"
         if len(matches) > 1:
             return None, None, f"неоднозначное имя файла: {doc_name}"
@@ -3785,7 +3766,7 @@ class BotHandlers:
 
         for msg_id, tracking_info in self.editor_tracking.items():
             sent_at = tracking_info.get("sent_at")
-            if tracking_info.get("editor_job_id") and tracking_info.get("first_report_at"):
+            if tracking_info.get("editor_job_id"):
                 continue
             if isinstance(sent_at, datetime) and current_time - sent_at > timedelta(hours=24):
                 to_remove.append(msg_id)
@@ -4093,7 +4074,7 @@ class BotHandlers:
         author = message.from_user.username or str(message.from_user.id) if message.from_user else "unknown"
         print(f"\n📨 Новое сообщение от {author}")
 
-        if (str(message.document.file_name or "").lower().endswith(".pdf")
+        if (message.document is not None and str(message.document.file_name or "").lower().endswith(".pdf")
                 and "__job" in message.document.file_name.lower() and not self.is_bot_message(author)):
             await self.handle_editor_response(client, message)
             return
@@ -5410,15 +5391,6 @@ class BotHandlers:
                     print(f"⏭️  PDF редактора уже доставлен: {file_name}")
                     self._log_editor(f"⏭️ PDF редактора уже доставлен повторно: {file_name}")
                     return
-
-            if tracking_info.get("fixed_author_editor_route") and not tracking_info.get("editor_job_id"):
-                report_names = {
-                    file_name, tracking_info.get("expected_pdf_name"), tracking_info.get("expected_ai_pdf_name"),
-                }
-                for report_name in filter(None, report_names):
-                    self._get_editor_safety_store().remember_editor_report(
-                        *self._editor_safety_context(tracking_info, report_name)
-                    )
 
             response_claim_key, claimed = self._claim_editor_response(message)
             if not claimed:
