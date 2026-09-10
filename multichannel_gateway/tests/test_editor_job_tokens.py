@@ -11,6 +11,39 @@ from multichannel_gateway.tests import test_forced_author_routing as fixtures
 
 
 class EditorJobTokenTests(unittest.IsolatedAsyncioTestCase):
+    def test_editor_keys_accept_canonical_unicode_equivalence(self):
+        composed = "Рера\u0439т__job10855.pdf"
+        decomposed = "Рера\u0438\u0306т__job10855.pdf"
+        for key in (fixtures.BotHandlers._editor_report_key, fixtures.BotHandlers._editor_file_key):
+            with self.subTest(key=key.__name__):
+                self.assertEqual(key(composed), key(decomposed))
+                self.assertNotEqual(key("Диплом Иванов__job10855.pdf"), key("Диплом Петров__job10855.pdf"))
+                self.assertNotEqual(key("①__job10855.pdf"), key("1__job10855.pdf"))
+
+    def test_editor_job_correlation_accepts_canonical_unicode_in_both_directions(self):
+        composed, decomposed = "Рера\u0439т", "Рера\u0438\u0306т"
+        handlers = fixtures.BotHandlers.__new__(fixtures.BotHandlers)
+        for expected, incoming in ((composed, decomposed), (decomposed, composed)):
+            info = {
+                "editor_job_id": 10855, "sent_from_account": "НИК-2",
+                "destination": "@editor", "chat_id": 900,
+                "expected_pdf_name": f"{expected}__job10855.pdf",
+                "expected_ai_pdf_name": f"ИИ {expected}__job10855.pdf",
+            }
+            handlers.editor_tracking = {"task": info}
+            for prefix in ("", "ИИ "):
+                with self.subTest(expected=expected, prefix=prefix):
+                    result = handlers._find_token_editor_assignment(
+                        "editor", f"{prefix}{incoming}__job10855.pdf", "НИК-2", 900,
+                    )
+                    self.assertEqual(("task", info, "exact editor job 10855"), result)
+                    self.assertEqual(f"{expected}__job10855.pdf", info["expected_pdf_name"])
+                    self.assertEqual(f"ИИ {expected}__job10855.pdf", info["expected_ai_pdf_name"])
+            result = handlers._find_token_editor_assignment(
+                "editor", "Другое имя__job10855.pdf", "НИК-2", 900,
+            )
+            self.assertEqual((None, None, "editor job report name mismatch"), result)
+
     async def assignments(self, ids=(101, 102), **settings):
         tasks = [fixtures.telegram_file_info(f"client-{job}", job, "ДИПЛОМ (копия).docx", message_id=job) for job in ids]
         for job, task in zip(ids, tasks):

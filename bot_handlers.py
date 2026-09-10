@@ -4,6 +4,7 @@ import asyncio
 import shutil
 import tempfile
 import uuid
+import unicodedata
 import time as time_module  # Переименовываем стандартный модуль time
 from datetime import datetime, time, timedelta
 from pathlib import PurePath
@@ -2790,11 +2791,13 @@ class BotHandlers:
     @staticmethod
     def _editor_file_key(file_name: str) -> str:
         stem = os.path.splitext(os.path.basename(str(file_name or "")))[0]
+        stem = unicodedata.normalize("NFC", stem)
         return re.sub(r"\s+", " ", stem).strip().casefold()
 
     @staticmethod
     def _editor_report_key(file_name: str) -> str:
         name = os.path.basename(str(file_name or ""))
+        name = unicodedata.normalize("NFC", name)
         return re.sub(r"\s+", " ", name).strip().casefold()
 
     @classmethod
