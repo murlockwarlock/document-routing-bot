@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from multichannel_gateway.core.attachment_filters import is_image_attachment
 from multichannel_gateway.core.models import AttachmentRef, DownloadedAttachment, InboundEnvelope, utc_now
 
 from .base import TransportAdapter
@@ -54,8 +55,13 @@ class VkCallbackAdapter(TransportAdapter):
             if item.get("type") != "doc":
                 continue
             doc = item.get("doc") or {}
-            attachments.append(cls._build_doc_attachment(next_index, doc, counter_message))
+            attachment = cls._build_doc_attachment(next_index, doc, counter_message)
             next_index += 1
+            if is_image_attachment(attachment.file_name, attachment.mime_type) or is_image_attachment(
+                f"attachment.{doc.get('ext') or ''}"
+            ):
+                continue
+            attachments.append(attachment)
 
         reply_message = message.get("reply_message") or {}
         if reply_message:

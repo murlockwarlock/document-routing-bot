@@ -285,7 +285,10 @@ class VkAdapterFileNameExtensionTest(unittest.TestCase):
         })
         envelope = VkCallbackAdapter.build_envelope(payload)
         # Current logic: if '.' in title, don't append ext
-        self.assertEqual("image.jpeg", envelope.attachments[0].file_name)
+        doc = payload["object"]["message"]["attachments"][0]["doc"]
+        attachment = VkCallbackAdapter._build_doc_attachment(0, doc)
+        self.assertEqual("image.jpeg", attachment.file_name)
+        self.assertEqual((), envelope.attachments)
 
     def test_no_ext_and_no_dot_in_title(self) -> None:
         """Title='document', no ext field → 'document' as-is."""

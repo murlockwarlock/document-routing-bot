@@ -21,6 +21,7 @@ import fnmatch
 from config import Config, AccountManager
 from log_utils import append_channel_log
 from multichannel_gateway.bootstrap import build_store
+from multichannel_gateway.core.attachment_filters import is_image_attachment
 from multichannel_gateway.integrations.telegram_ingest import ingest_pyrogram_message
 from multichannel_gateway.outbound import OutboundDispatcher
 
@@ -4032,6 +4033,11 @@ class BotHandlers:
     async def handle_main_account(self, client, message):
         """Обработка сообщений в основном аккаунте (НИК-1)"""
         if not message.document and not message.text:
+            return
+
+        if message.document and is_image_attachment(
+            message.document.file_name, getattr(message.document, "mime_type", None)
+        ):
             return
 
         if not getattr(message, "from_user", None):
