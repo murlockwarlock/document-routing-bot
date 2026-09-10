@@ -2803,10 +2803,10 @@ class BotHandlers:
     @classmethod
     def _editor_assignment_report_key(cls, file_name: str) -> str:
         name = os.path.basename(str(file_name or ""))
-        basename, token_marker, token_suffix = name.rpartition("_job")
-        if not token_marker:
+        match = re.search(r"job[0-9]+\.[^.]+$", name)
+        if not match:
             return re.sub(r"[\s_]+", "", cls._editor_report_key(name))
-        return re.sub(r"[\s_]+", "", cls._editor_report_key(basename)) + "__job" + token_suffix.lower()
+        return re.sub(r"[\s_]+", "", cls._editor_report_key(name[:match.start()])) + "__" + match.group().lower()
 
     @classmethod
     def _editor_tracking_keys(cls, tracking_info: dict) -> set[str]:
@@ -2824,7 +2824,7 @@ class BotHandlers:
     def _editor_tracking_matches_file(cls, doc_name: str, tracking_info: dict) -> bool:
         if tracking_info.get("editor_job_id"):
             names = {tracking_info["expected_pdf_name"], tracking_info["expected_ai_pdf_name"]}
-            if "_job" not in doc_name.lower():
+            if not cls._has_editor_job_marker(doc_name):
                 stem = tracking_info["original_basename"]
                 names = {stem + ".pdf", "ИИ " + stem + ".pdf"}
             return cls._editor_assignment_report_key(os.path.splitext(doc_name)[0] + ".pdf") in {
@@ -2993,9 +2993,14 @@ class BotHandlers:
         return score, -ordinal
 
     @staticmethod
+    def _has_editor_job_marker(file_name):
+        name = os.path.basename(str(file_name or "")).lower()
+        return "_job" in name or bool(re.search(r"job[0-9]+$", os.path.splitext(name)[0]))
+
+    @staticmethod
     def _editor_job_token(file_name):
         stem, extension = os.path.splitext(os.path.basename(str(file_name or "")))
-        match = re.search(r"_+job([1-9][0-9]*)$", stem)
+        match = re.search(r"job([1-9][0-9]*)$", stem)
         return int(match.group(1)) if match and extension.lower() == ".pdf" else None
 
     async def _send_human_editor_document(self, client, destination, path, info):
@@ -3073,7 +3078,7 @@ class BotHandlers:
         reply_chat_id=None,
     ):
         self._expire_editor_assignments()
-        if "_job" in str(doc_name).lower():
+        if self._has_editor_job_marker(doc_name):
             return self._find_token_editor_assignment(sender, doc_name, sent_from_account, reply_chat_id)
         sender_clean = str(sender or "").replace("@", "").lower()
         candidates = [
@@ -4114,7 +4119,7 @@ class BotHandlers:
         print(f"\n📨 Новое сообщение от {author}")
 
         if (message.document is not None and str(message.document.file_name or "").lower().endswith(".pdf")
-                and "_job" in message.document.file_name.lower() and not self.is_bot_message(author)):
+                and self._has_editor_job_marker(message.document.file_name) and not self.is_bot_message(author)):
             await self.handle_editor_response(client, message)
             return
 
@@ -5261,7 +5266,7 @@ class BotHandlers:
             tracking_key = None
             self._expire_editor_assignments()
             incoming_name = getattr(getattr(message, "document", None), "file_name", "") or ""
-            token_response = "_job" in incoming_name.lower()
+            token_response = self._has_editor_job_marker(incoming_name)
             if token_response:
                 sender = message.from_user.username or str(message.from_user.id) if getattr(message, "from_user", None) else ""
                 tracking_key, tracking_info, reason = self._find_token_editor_assignment(

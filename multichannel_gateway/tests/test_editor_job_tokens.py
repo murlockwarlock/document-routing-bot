@@ -199,11 +199,39 @@ class EditorJobTokenTests(unittest.IsolatedAsyncioTestCase):
 
     def test_pdf_token_parser(self):
         parse = fixtures.BotHandlers._editor_job_token
-        for name in ("ДИПЛОМ__job82.pdf", "ИИ ДИПЛОМ (копия)__job82.pdf", "my job notes__job82.PDF", "ДИПЛОМ_job82.pdf", "ДИПЛОМ____job82.pdf"):
+        for name in ("ДИПЛОМ__job82.pdf", "ИИ ДИПЛОМ (копия)__job82.pdf", "my job notes__job82.PDF", "ДИПЛОМ_job82.pdf", "ДИПЛОМ____job82.pdf", "ДИПЛОМjob82.pdf", "job82.pdf"):
             self.assertEqual(82, parse(name))
-        for name in ("job82.pdf", "ДИПЛОМ__job0.pdf", "ДИПЛОМ__job-82.pdf", "ДИПЛОМ__job82 copy.pdf",
+        for name in ("ДИПЛОМ__job0.pdf", "ДИПЛОМ__job-82.pdf", "ДИПЛОМ__job82 copy.pdf",
                      "ДИПЛОМ__job82.pdf.bak", "ДИПЛОМ__job82.docx", "ДИПЛОМ__jobx.pdf", "ДИПЛОМ__job01.pdf"):
             self.assertIsNone(parse(name), name)
+
+    async def test_bare_job_token_main_entry_and_fail_closed_controls(self):
+        handlers, nik1, nik2 = await self.assignments()
+        for message in (
+            self.response(name="ДИПЛОМ_(копия)job101.pdf", sender="other"),
+            self.response(name="ДИПЛОМ_(копия)job101.pdf", chat=901),
+            self.response(name="ДИПЛОМ_(копия)job101.pdf", reply=1102),
+            self.response(name="ДИПЛОМ_(копия)job999.pdf", reply=1101),
+            self.response(name="otherjob101.pdf"), self.response(name="job101.pdf"),
+            self.response(name="ДИПЛОМ_(копия)job0101.pdf", reply=1101),
+            self.response(name="ДИПЛОМ_(копия)JOB101.pdf", reply=1101),
+        ):
+            await handlers.handle_editor_response(nik2, message)
+            message.download.assert_not_awaited()
+            nik1.send_document.assert_not_awaited()
+        for job in (102, 101):
+            for ai in (True, False):
+                before = nik1.send_document.await_count
+                message = self.response(job, ai=ai, name=f"{'ИИ_' if ai else ''}ДИПЛОМ_(копия)job{job}.pdf")
+                with patch("bot_handlers.Config.get_setting", side_effect=fixtures.settings_lookup(fixtures.base_settings([]))):
+                    await handlers.handle_main_account(nik2, message)
+                self.assertEqual(before + 1, nik1.send_document.await_count)
+                self.assertEqual(job, nik1.send_document.await_args.kwargs["chat_id"])
+                duplicate = self.response(job, ai=ai, incoming_id=90000 + job * 2 + int(ai))
+                await handlers.handle_editor_response(nik2, duplicate)
+                duplicate.download.assert_not_awaited()
+                self.assertEqual(before + 1, nik1.send_document.await_count)
+        self.assertEqual({}, handlers.editor_tracking)
 
     async def test_single_underscore_token_main_entry_normal_ai_and_duplicate(self):
         handlers, nik1, nik2 = await self.assignments(names=["анти ДИПЛОМ копия Рерайт_2_2.docx"] * 2)
