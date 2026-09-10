@@ -44,8 +44,9 @@ class EditorJobTokenTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual((None, None, "editor job report name mismatch"), result)
 
-    async def assignments(self, ids=(101, 102), **settings):
-        tasks = [fixtures.telegram_file_info(f"client-{job}", job, "ДИПЛОМ (копия).docx", message_id=job) for job in ids]
+    async def assignments(self, ids=(101, 102), names=None, **settings):
+        names = names or ["ДИПЛОМ (копия).docx"] * len(ids)
+        tasks = [fixtures.telegram_file_info(f"client-{job}", job, name, message_id=job) for job, name in zip(ids, names)]
         for job, task in zip(ids, tasks):
             task.update(gateway_job_id=job, force_plagiscan=False)
         config = fixtures.base_settings(
@@ -70,6 +71,131 @@ class EditorJobTokenTests(unittest.IsolatedAsyncioTestCase):
             return path
         message.download = AsyncMock(side_effect=download)
         return message
+
+    async def test_separator_variants_deliver_normal_ai_once_to_exact_authors(self):
+        names = ["Диплом Иванов.docx", "Диплом_Иванов.docx", "Рерайт  Иванов_2.docx"]
+        for mode in ("mode1", "mode2"):
+            with self.subTest(mode=mode):
+                handlers, nik1, nik2 = await self.assignments((101, 102, 103), names=names, mode=mode)
+                original_count = handlers.files_today["count"]
+                self.assertEqual([f"{Path(name).stem}__job{job}.docx" for job, name in zip((101, 102, 103), names)],
+                                 [c.kwargs["file_name"] for c in nik2.send_document.await_args_list])
+                for job, incoming, original in (
+                    (102, "Диплом Иванов", "Диплом_Иванов"),
+                    (103, "Рераи\u0306т_Иванов 2", "Рерайт  Иванов_2"),
+                    (101, "Диплом___Иванов", "Диплом Иванов"),
+                ):
+                    for ai in (True, False):
+                        before = nik1.send_document.await_count
+                        name = f"{'ИИ_' if ai else ''}{incoming}__job{job}.pdf"
+                        message = self.response(job, ai=ai, name=name)
+                        with patch("bot_handlers.Config.get_setting", side_effect=fixtures.settings_lookup(fixtures.base_settings([], mode=mode))):
+                            await handlers.handle_main_account(nik2, message)
+                        self.assertEqual(before + 1, nik1.send_document.await_count)
+                        self.assertEqual(job, nik1.send_document.await_args.kwargs["chat_id"])
+                        self.assertEqual(f"{'ИИ ' if ai else ''}{original}.pdf", nik1.send_document.await_args.kwargs["file_name"])
+                        duplicate = self.response(job, ai=ai, name=f"{'ИИ ' if ai else ''}{incoming.replace('_', ' ')}__job{job}.pdf",
+                                                  incoming_id=50000 + job * 2 + int(ai))
+                        await handlers.handle_editor_response(nik2, duplicate)
+                        self.assertEqual(before + 1, nik1.send_document.await_count)
+                        duplicate.download.assert_not_awaited()
+                self.assertEqual({}, handlers.editor_tracking)
+                self.assertEqual(original_count, handlers.files_today["count"])
+
+    async def test_separator_variants_cannot_bypass_job_sender_chat_reply_or_name(self):
+        handlers, nik1, nik2 = await self.assignments(names=["Диплом Иванов.docx", "Диплом_Иванов.docx"])
+        valid = "Диплом_Иванов__job101.pdf"
+        attempts = (
+            self.response(name=valid, sender="other-editor"),
+            self.response(name=valid, chat=901),
+            self.response(name=valid, reply=1102),
+            self.response(name="Диплом_Иванов__job999.pdf"),
+            self.response(name="Диплом_Петров__job101.pdf"),
+            self.response(name="ДипломИванов__job101.pdf"),
+            self.response(name="Диплом_Иванов_job101.pdf", reply=1101),
+            self.response(name="Диплом_Иванов__job_101.pdf", reply=1101),
+            self.response(name="Диплом_Иванов__job101_.pdf", reply=1101),
+            self.response(name="Диплом_Иванов__job0101.pdf", reply=1101),
+            self.response(name="Диплом_Иванов__JOB101.pdf", reply=1101),
+            self.response(name="Диплом_Иванов.pdf"),
+        )
+        for message in attempts:
+            with self.subTest(name=message.document.file_name, sender=message.from_user.username,
+                              chat=message.chat.id, reply=message.reply_to_message_id):
+                await handlers.handle_editor_response(nik2, message)
+                message.download.assert_not_awaited()
+                nik1.send_document.assert_not_awaited()
+                self.assertEqual(2, len(handlers.editor_tracking))
+        await handlers.handle_editor_response(nik1, self.response(name=valid))
+        nik1.send_document.assert_not_awaited()
+        await handlers.handle_editor_response(nik2, self.response(name=valid, reply=1101))
+        nik1.send_document.assert_awaited_once()
+        self.assertEqual(101, nik1.send_document.await_args.kwargs["chat_id"])
+
+    async def test_separator_plain_explicit_reply_and_ai_classification(self):
+        handlers, nik1, nik2 = await self.assignments((101,), names=["Диплом Иванов.docx"])
+        info = next(iter(handlers.editor_tracking.values()))
+        self.assertTrue(handlers._editor_tracking_matches_file("Диплом_Иванов.docx", info))
+        self.assertTrue(handlers._editor_tracking_matches_file("Диплом_Иванов__job101.docx", info))
+        await handlers.handle_editor_response(nik2, self.response(name="ИИ_Диплом_Иванов.pdf", reply=1101))
+        nik1.send_document.assert_awaited_once()
+        self.assertEqual("ИИ Диплом Иванов.pdf", nik1.send_document.await_args.kwargs["file_name"])
+        info = next(iter(handlers.editor_tracking.values()))
+        self.assertTrue(info["ai_report_delivered"])
+        self.assertFalse(info["normal_report_delivered"])
+
+    async def test_separator_group_priority_and_different_editors_preserve_return_routes(self):
+        for mode in ("mode1", "mode2"):
+            with self.subTest(mode=mode):
+                tasks = [
+                    fixtures.telegram_file_info("forced", 42, "Диплом Иванов.docx", chat_id=-100123, message_id=777),
+                    fixtures.telegram_file_info("forced", 42, "Диплом_Иванов.docx", message_id=778),
+                ]
+                for job, task in zip((101, 102), tasks):
+                    task.update(gateway_job_id=job, force_plagiscan=False)
+                settings = fixtures.base_settings(
+                    ["forced"], mode=mode, forced_authors_destination="editor",
+                    forced_authors_editor_nickname="@forced-editor",
+                    telegram_group_routes={"-100123": {"destination": "editor", "editor_nickname": "@group-editor"}},
+                )
+                sent = [SimpleNamespace(id=1101, chat=SimpleNamespace(id=900)),
+                        SimpleNamespace(id=1102, chat=SimpleNamespace(id=901))]
+                handlers, nik1, nik2 = await fixtures.TestEditorReportsForFixedRoute._make_handlers_with_tasks(self, tasks, sent, settings)
+                nik2.name = "НИК-2"
+                handlers._mark_gateway_job_done = AsyncMock()
+                self.assertEqual(["@group-editor", "@forced-editor"], [c.kwargs["chat_id"] for c in nik2.send_document.await_args_list])
+                for job, sender, chat, origin, reply, original in (
+                    (102, "forced-editor", 901, 42, 778, "Диплом_Иванов"),
+                    (101, "group-editor", 900, -100123, 777, "Диплом Иванов"),
+                ):
+                    for ai in (False, True):
+                        name = f"{'ИИ_' if ai else ''}Диплом__Иванов__job{job}.pdf"
+                        wrong = self.response(job, ai=ai, name=name, sender="group-editor" if job == 102 else "forced-editor", chat=chat)
+                        before = nik1.send_document.await_count
+                        await handlers.handle_editor_response(nik2, wrong)
+                        wrong.download.assert_not_awaited()
+                        self.assertEqual(before, nik1.send_document.await_count)
+                        message = self.response(job, ai=ai, name=name, sender=sender, chat=chat)
+                        await handlers.handle_editor_response(nik2, message)
+                        self.assertEqual(before + 1, nik1.send_document.await_count)
+                        kwargs = nik1.send_document.await_args.kwargs
+                        self.assertEqual(origin, kwargs["chat_id"])
+                        if origin < 0:
+                            self.assertEqual(reply, kwargs["reply_to_message_id"])
+                        self.assertEqual(f"{'ИИ ' if ai else ''}{original}.pdf", kwargs["file_name"])
+                self.assertEqual({}, handlers.editor_tracking)
+
+    def test_legacy_and_shared_keys_do_not_gain_separator_matching(self):
+        handlers = fixtures.BotHandlers.__new__(fixtures.BotHandlers)
+        handlers.editor_tracking = {
+            "first": {"destination": "@editor", "sent_from_account": "НИК-2", "original_name": "Диплом Иванов.docx"},
+            "second": {"destination": "@editor", "sent_from_account": "НИК-2", "original_name": "Диплом_Иванов.docx"},
+        }
+        for name, expected in (("Диплом Иванов.pdf", "first"), ("Диплом_Иванов.pdf", "second")):
+            self.assertEqual(expected, handlers.find_editor_tracking_for_unreplied_pdf("editor", name)[0])
+        self.assertIsNone(handlers.find_editor_tracking_for_unreplied_pdf("editor", "Диплом__Иванов.pdf")[0])
+        for key in (handlers._editor_file_key, handlers._editor_report_key):
+            self.assertNotEqual(key("ИИ_диплом.pdf"), key("ИИ диплом.pdf"))
 
     def test_pdf_token_parser(self):
         parse = fixtures.BotHandlers._editor_job_token

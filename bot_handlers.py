@@ -2801,6 +2801,14 @@ class BotHandlers:
         return re.sub(r"\s+", " ", name).strip().casefold()
 
     @classmethod
+    def _editor_assignment_report_key(cls, file_name: str) -> str:
+        name = os.path.basename(str(file_name or ""))
+        basename, token_marker, token_suffix = name.rpartition("__job")
+        if not token_marker:
+            return cls._editor_report_key(name.replace("_", " "))
+        return cls._editor_report_key(basename.replace("_", " ")) + token_marker + token_suffix.lower()
+
+    @classmethod
     def _editor_tracking_keys(cls, tracking_info: dict) -> set[str]:
         names = {
             tracking_info.get("original_name"),
@@ -2814,10 +2822,15 @@ class BotHandlers:
 
     @classmethod
     def _editor_tracking_matches_file(cls, doc_name: str, tracking_info: dict) -> bool:
+        if tracking_info.get("editor_job_id"):
+            names = {tracking_info["expected_pdf_name"], tracking_info["expected_ai_pdf_name"]}
+            if "__job" not in doc_name.lower():
+                stem = tracking_info["original_basename"]
+                names = {stem + ".pdf", "ИИ " + stem + ".pdf"}
+            return cls._editor_assignment_report_key(os.path.splitext(doc_name)[0] + ".pdf") in {
+                cls._editor_assignment_report_key(os.path.splitext(name)[0] + ".pdf") for name in names
+            }
         doc_key = cls._editor_file_key(doc_name)
-        if tracking_info.get("editor_job_id") and "__job" not in doc_name.lower():
-            stem = tracking_info["original_basename"]
-            return doc_key in {cls._editor_file_key(stem + ".pdf"), cls._editor_file_key("ИИ " + stem + ".pdf")}
         return bool(doc_key and doc_key in cls._editor_tracking_keys(tracking_info or {}))
 
     @staticmethod
@@ -3033,8 +3046,8 @@ class BotHandlers:
             return None, None, "editor job chat mismatch"
         if reply_id is not None and reply_id != info.get("reply_to_message_id"):
             return None, None, "editor job token/reply conflict"
-        expected = {self._editor_report_key(info["expected_pdf_name"]), self._editor_report_key(info["expected_ai_pdf_name"])}
-        if self._editor_report_key(file_name) not in expected:
+        expected = {self._editor_assignment_report_key(info["expected_pdf_name"]), self._editor_assignment_report_key(info["expected_ai_pdf_name"])}
+        if self._editor_assignment_report_key(file_name) not in expected:
             return None, None, "editor job report name mismatch"
         return key, info, f"exact editor job {job_id}"
 
@@ -3042,8 +3055,8 @@ class BotHandlers:
         if not info.get("editor_job_id"):
             return incoming_name
         original = info["original_basename"]
-        ai = self._editor_report_key(incoming_name) in {
-            self._editor_report_key(info["expected_ai_pdf_name"]), self._editor_report_key(f"ИИ {original}.pdf"),
+        ai = self._editor_assignment_report_key(incoming_name) in {
+            self._editor_assignment_report_key(info["expected_ai_pdf_name"]), self._editor_assignment_report_key(f"ИИ {original}.pdf"),
         }
         return ("ИИ " if ai else "") + original + ".pdf"
 
