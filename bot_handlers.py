@@ -6,6 +6,7 @@ import tempfile
 import uuid
 import time as time_module  # Переименовываем стандартный модуль time
 from datetime import datetime, time, timedelta
+from pathlib import PurePath
 from pyrogram_asyncio_compat import ensure_main_event_loop
 
 ensure_main_event_loop()
@@ -21,12 +22,28 @@ import fnmatch
 from config import Config, AccountManager
 from log_utils import append_channel_log
 from multichannel_gateway.bootstrap import build_store
-from multichannel_gateway.core.attachment_filters import is_image_attachment
 from multichannel_gateway.integrations.telegram_ingest import ingest_pyrogram_message
 from multichannel_gateway.outbound import OutboundDispatcher
 
 # Абсолютный путь к директории временных файлов (Fix #5: не зависит от CWD)
 FILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "files")
+
+
+IMAGE_EXTENSIONS = frozenset({
+    ".jpg", ".jpeg", ".jpe", ".jfif", ".pjpeg", ".pjp", ".png", ".apng",
+    ".webp", ".gif", ".bmp", ".dib", ".tif", ".tiff", ".heic", ".heif",
+    ".hif", ".avif", ".avifs", ".svg", ".svgz", ".ico", ".cur", ".icns",
+    ".jxl", ".jp2", ".j2k", ".jpf", ".jpx", ".jpm", ".mj2", ".psd",
+    ".psb", ".raw", ".dng", ".cr2", ".cr3", ".nef", ".nrw", ".arw",
+    ".orf", ".rw2", ".raf", ".pef", ".srw", ".tga", ".pcx", ".dds",
+    ".ppm", ".pgm", ".pbm", ".pnm", ".pam", ".exr", ".hdr", ".xbm", ".xpm",
+})
+
+
+def is_image_attachment(file_name: str | None, mime_type: str | None = None) -> bool:
+    return (
+        isinstance(mime_type, str) and mime_type.strip().lower().startswith("image/")
+    ) or PurePath(str(file_name or "").strip()).suffix.lower() in IMAGE_EXTENSIONS
 
 
 class VkApiError(RuntimeError):
