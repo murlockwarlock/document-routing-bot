@@ -1285,6 +1285,7 @@ class CounterModeProcessor:
             )
             if len(items) < page_size or (oldest_ts is not None and oldest_ts < start_ts):
                 break
+            await asyncio.sleep(0.5)
             offset += page_size
 
         return messages

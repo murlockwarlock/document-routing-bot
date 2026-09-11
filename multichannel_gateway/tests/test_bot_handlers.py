@@ -1800,7 +1800,7 @@ class TestVkCounterMode(unittest.IsolatedAsyncioTestCase):
         ):
             await self.processor.analyze_vk_files_history_auto("101", date_str="2026-05-20")
 
-        sleep_mock.assert_awaited_once_with(2)
+        self.assertEqual([call.args[0] for call in sleep_mock.await_args_list], [0.5, 2])
         calls = self.processor._vk_api_call.call_args_list
         self.assertEqual([0, 200, 200], [call.args[1]["offset"] for call in calls])
         sent_files = self.processor.generate_counter_report_simple.await_args.args[0]
