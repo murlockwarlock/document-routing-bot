@@ -41,7 +41,7 @@ class _FakeFloodWait(Exception):
 sys.modules["pyrogram.errors"].FloodWait = _FakeFloodWait
 
 # Now we can import the module under test
-from bot_handlers import BotHandlers, CounterModeProcessor, FILES_DIR, FileProcessor  # noqa: E402
+from bot_handlers import BotHandlers, CounterModeProcessor, FILES_DIR, FileProcessor, VkApiError  # noqa: E402
 
 
 def _make_account_manager():
@@ -1658,6 +1658,154 @@ class TestVkCounterMode(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1065504879, calls[0].args[1]["peer_id"])
         sent_files = self.processor.generate_counter_report_simple.await_args.args[0]
         self.assertEqual(["direct.docx"], [item["file_name"] for item in sent_files])
+
+    async def test_vk_history_auto_retries_flood_control_and_continues(self):
+        start_ts = int(datetime(2026, 5, 20, 0, 0).timestamp())
+        self.processor._vk_api_call = Mock(
+            side_effect=[
+                VkApiError("messages.getHistory", {"error_code": 9, "error_msg": "Flood control"}),
+                {"items": [self._msg(start_ts + 60, docs=["after-flood.docx"])]},
+            ]
+        )
+
+        with (
+            patch.object(self.processor, "_resolve_vk_counter_author_ids", return_value={101}),
+            patch.object(self.processor, "_vk_counter_peer_ids_for_authors", return_value=["2000000002"]),
+            patch.object(self.processor, "_vk_local_counter_status_map", return_value={}),
+            patch("bot_handlers.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+            patch("builtins.print") as print_mock,
+        ):
+            await self.processor.analyze_vk_files_history_auto("101", date_str="2026-05-20")
+
+        sleep_mock.assert_awaited_once_with(2)
+        self.assertEqual(2, self.processor._vk_api_call.call_count)
+        self.assertEqual(["after-flood.docx"], [item["file_name"] for item in self.processor.generate_counter_report_simple.await_args.args[0]])
+        printed = " ".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+        self.assertIn("error_code=9", printed)
+        self.assertIn("Доступ к истории VK восстановлен", printed)
+
+    async def test_vk_history_auto_retries_too_many_requests_and_continues(self):
+        start_ts = int(datetime(2026, 5, 20, 0, 0).timestamp())
+        self.processor._vk_api_call = Mock(
+            side_effect=[
+                VkApiError("messages.getHistory", {"error_code": 6, "error_msg": "Too many requests per second"}),
+                {"items": [self._msg(start_ts + 60, docs=["after-rate-limit.docx"])]},
+            ]
+        )
+
+        with (
+            patch.object(self.processor, "_resolve_vk_counter_author_ids", return_value={101}),
+            patch.object(self.processor, "_vk_counter_peer_ids_for_authors", return_value=["2000000002"]),
+            patch.object(self.processor, "_vk_local_counter_status_map", return_value={}),
+            patch("bot_handlers.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+        ):
+            await self.processor.analyze_vk_files_history_auto("101", date_str="2026-05-20")
+
+        sleep_mock.assert_awaited_once_with(2)
+        self.assertEqual(["after-rate-limit.docx"], [item["file_name"] for item in self.processor.generate_counter_report_simple.await_args.args[0]])
+
+    async def test_vk_history_auto_flood_control_after_retries_is_error_without_report(self):
+        error = VkApiError("messages.getHistory", {"error_code": 9, "error_msg": "Flood control"})
+        self.processor._vk_api_call = Mock(side_effect=[error, error, error, error])
+
+        with (
+            patch.object(self.processor, "_resolve_vk_counter_author_ids", return_value={101}),
+            patch.object(self.processor, "_vk_counter_peer_ids_for_authors", return_value=["2000000002"]),
+            patch.object(self.processor, "_vk_local_counter_status_map", return_value={}),
+            patch("bot_handlers.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+            patch("builtins.print") as print_mock,
+        ):
+            await self.processor.analyze_vk_files_history_auto("101", date_str="2026-05-20")
+
+        self.assertEqual([call.args[0] for call in sleep_mock.await_args_list], [2, 5, 10])
+        self.assertEqual(4, self.processor._vk_api_call.call_count)
+        self.processor.generate_counter_report_simple.assert_not_awaited()
+        printed = " ".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+        self.assertIn("Не удалось получить историю VK-беседы 2000000002", printed)
+        self.assertIn("error_code=9", printed)
+        self.assertNotIn("Просмотрено сообщений в периоде: 0", printed)
+
+    async def test_vk_history_auto_access_denied_is_not_retried(self):
+        self.processor._vk_api_call = Mock(
+            side_effect=VkApiError("messages.getHistory", {"error_code": 15, "error_msg": "Access denied"})
+        )
+
+        with (
+            patch.object(self.processor, "_resolve_vk_counter_author_ids", return_value={101}),
+            patch.object(self.processor, "_vk_counter_peer_ids_for_authors", return_value=["2000000002"]),
+            patch.object(self.processor, "_vk_local_counter_status_map", return_value={}),
+            patch("bot_handlers.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+            patch("builtins.print") as print_mock,
+        ):
+            await self.processor.analyze_vk_files_history_auto("101", date_str="2026-05-20")
+
+        sleep_mock.assert_not_awaited()
+        self.processor._vk_api_call.assert_called_once()
+        self.processor.generate_counter_report_simple.assert_not_awaited()
+        printed = " ".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+        self.assertIn("Нет доступа к истории VK-беседы 2000000002", printed)
+
+    async def test_vk_history_auto_missing_counter_token_is_explicit_error(self):
+        self.processor._get_vk_api_token = Mock(side_effect=RuntimeError("VK Counter/User Token не задан"))
+        self.processor._vk_api_call = CounterModeProcessor._vk_api_call.__get__(self.processor)
+
+        with (
+            patch.object(self.processor, "_resolve_vk_counter_author_ids", return_value={101}),
+            patch.object(self.processor, "_vk_counter_peer_ids_for_authors", return_value=["2000000002"]),
+            patch.object(self.processor, "_vk_local_counter_status_map", return_value={}),
+            patch("builtins.print") as print_mock,
+        ):
+            await self.processor.analyze_vk_files_history_auto("101", date_str="2026-05-20")
+
+        self.processor.generate_counter_report_simple.assert_not_awaited()
+        printed = " ".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+        self.assertIn("Для VK-беседы 2000000002 нужен VK Counter/User Token", printed)
+
+    async def test_vk_history_auto_successful_empty_history_is_zero_report(self):
+        self.processor._vk_api_call = Mock(return_value={"items": []})
+
+        with (
+            patch.object(self.processor, "_resolve_vk_counter_author_ids", return_value={101}),
+            patch.object(self.processor, "_vk_counter_peer_ids_for_authors", return_value=["2000000002"]),
+            patch.object(self.processor, "_vk_local_counter_status_map", return_value={}),
+            patch("builtins.print") as print_mock,
+        ):
+            await self.processor.analyze_vk_files_history_auto("101", date_str="2026-05-20")
+
+        self.processor.generate_counter_report_simple.assert_awaited_once()
+        self.assertEqual([], self.processor.generate_counter_report_simple.await_args.args[0])
+        printed = " ".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
+        self.assertIn("Просмотрено сообщений в периоде: 0", printed)
+
+    async def test_vk_history_auto_retries_paginated_page_without_duplicates(self):
+        start_ts = int(datetime(2026, 5, 20, 0, 0).timestamp())
+        first_page = {
+            "items": [self._msg(start_ts + 1000 + index, cmid=index) for index in range(199)]
+            + [self._msg(start_ts + 1200, cmid=199, docs=["first-page.docx"])],
+        }
+        second_page = {"items": [self._msg(start_ts + 60, cmid=200, docs=["second-page.docx"])]}
+        self.processor._vk_api_call = Mock(
+            side_effect=[
+                first_page,
+                VkApiError("messages.getHistory", {"error_code": 9, "error_msg": "Flood control"}),
+                second_page,
+            ]
+        )
+
+        with (
+            patch.object(self.processor, "_resolve_vk_counter_author_ids", return_value={101}),
+            patch.object(self.processor, "_vk_counter_peer_ids_for_authors", return_value=["2000000002"]),
+            patch.object(self.processor, "_vk_local_counter_status_map", return_value={}),
+            patch("bot_handlers.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+        ):
+            await self.processor.analyze_vk_files_history_auto("101", date_str="2026-05-20")
+
+        sleep_mock.assert_awaited_once_with(2)
+        calls = self.processor._vk_api_call.call_args_list
+        self.assertEqual([0, 200, 200], [call.args[1]["offset"] for call in calls])
+        sent_files = self.processor.generate_counter_report_simple.await_args.args[0]
+        self.assertEqual(["second-page.docx", "first-page.docx"], [item["file_name"] for item in sent_files])
+        self.assertEqual(2, len({item["file_key"] for item in sent_files}))
 
     def test_vk_longpoll_counter_datetime_falls_back_to_created_at(self):
         job = self._job(

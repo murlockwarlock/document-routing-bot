@@ -1212,6 +1212,42 @@ class CounterModeProcessor:
                 }
         return result
 
+    async def _fetch_vk_history_page_with_retry(
+        self,
+        peer_id: str,
+        page_size: int,
+        offset: int,
+        token_kind: str,
+    ) -> dict:
+        retry_delays = (2, 5, 10)
+        retried = False
+        for attempt in range(len(retry_delays) + 1):
+            try:
+                response = await asyncio.to_thread(
+                    self._vk_api_call,
+                    "messages.getHistory",
+                    {
+                        "peer_id": int(peer_id),
+                        "count": page_size,
+                        "offset": offset,
+                        "_token_kind": token_kind,
+                    },
+                )
+            except VkApiError as exc:
+                if exc.code not in {6, 9} or attempt >= len(retry_delays):
+                    raise
+                delay = retry_delays[attempt]
+                print(f"⚠️ VK временно ограничил запросы (error_code={exc.code}: {exc.message or 'неизвестная ошибка'}).")
+                print(f"🔄 Повтор {attempt + 1}/{len(retry_delays)} через {delay} сек...")
+                await asyncio.sleep(delay)
+                retried = True
+            else:
+                if retried:
+                    print("✅ Доступ к истории VK восстановлен. Продолжаю подсчет...")
+                return response
+
+        raise RuntimeError("VK history retry loop завершился неожиданно")
+
     async def _fetch_vk_history_messages_for_peer(
         self,
         peer_id: str,
@@ -1224,16 +1260,7 @@ class CounterModeProcessor:
         token_kind = self._vk_peer_token_kind(peer_id)
 
         while True:
-            response = await asyncio.to_thread(
-                self._vk_api_call,
-                "messages.getHistory",
-                {
-                    "peer_id": int(peer_id),
-                    "count": page_size,
-                    "offset": offset,
-                    "_token_kind": token_kind,
-                },
-            )
+            response = await self._fetch_vk_history_page_with_retry(peer_id, page_size, offset, token_kind)
             items = response.get("items") or []
             if not items:
                 break
@@ -1306,17 +1333,38 @@ class CounterModeProcessor:
             token_kind = self._vk_peer_token_kind(peer_id)
             try:
                 peer_messages = await self._fetch_vk_history_messages_for_peer(peer_id, start_ts, end_ts)
-            except RuntimeError as exc:
-                skipped_access += 1
-                self._log_vk_counter(f"history_skip_token peer_id={peer_id} token={token_kind} error={exc}")
-                continue
             except VkApiError as exc:
                 skipped_access += 1
                 self._log_vk_counter(
                     f"history_skip_access peer_id={peer_id} token={token_kind} "
                     f"code={exc.code} error={exc.error}"
                 )
-                continue
+                if exc.code == 15:
+                    print(f"❌ Нет доступа к истории VK-беседы {peer_id}.")
+                    print("Проверьте VK Counter/User Token и что аккаунт токена состоит в беседе.")
+                else:
+                    print(f"❌ Не удалось получить историю VK-беседы {peer_id}.")
+                    print(f"VK API: error_code={exc.code} — {exc.message or 'неизвестная ошибка'}.")
+                    print("Повторите запуск счетчика позже.")
+                return
+            except RuntimeError as exc:
+                skipped_access += 1
+                self._log_vk_counter(f"history_skip_token peer_id={peer_id} token={token_kind} error={exc}")
+                if token_kind == "counter" and "Counter/User Token" in str(exc):
+                    print(f"❌ Для VK-беседы {peer_id} нужен VK Counter/User Token.")
+                    print("Проверьте настройки VK Counter/User Token и повторите запуск счетчика позже.")
+                else:
+                    print(f"❌ Не удалось получить историю VK-беседы {peer_id}.")
+                    print(f"Ошибка VK: {exc}")
+                    print("Повторите запуск счетчика позже.")
+                return
+            except Exception as exc:
+                skipped_access += 1
+                self._log_vk_counter(f"history_error peer_id={peer_id} token={token_kind} error={exc}")
+                print(f"❌ Не удалось получить историю VK-беседы {peer_id}.")
+                print(f"Ошибка сети/VK API: {exc}")
+                print("Повторите запуск счетчика позже.")
+                return
             all_messages.extend(peer_messages)
 
         all_messages.sort(
