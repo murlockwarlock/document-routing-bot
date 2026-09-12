@@ -1544,7 +1544,7 @@ class TestVkCounterMode(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["370831.docx", "370831 анти.docx"], [item["file_name"] for item in sent_files])
         self.assertEqual(["vk_doc_999.pdf", "random_report.pdf"], [item["file_name"] for item in received_files])
         self.assertIn("370831", received_files[0]["file_name_normalized_aliases"])
-        self.assertIn("370831 анти", received_files[1]["file_name_normalized_aliases"])
+        self.assertIn("370831анти", received_files[1]["file_name_normalized_aliases"])
 
     async def test_vk_history_auto_counts_multiple_docs_in_one_author_and_bot_message(self):
         start_ts = int(datetime(2026, 5, 22, 0, 0).timestamp())
@@ -1683,6 +1683,28 @@ class TestVkCounterMode(unittest.IsolatedAsyncioTestCase):
         printed = " ".join(str(call.args[0]) for call in print_mock.call_args_list if call.args)
         self.assertIn("error_code=9", printed)
         self.assertIn("Доступ к истории VK восстановлен", printed)
+
+    async def test_vk_history_filename_variants_reach_final_report(self):
+        start_ts = int(datetime(2026, 5, 20).timestamp())
+        original = "Рерайт Иванов (1)"
+        incoming = "Рераи\u0306т_Иванов_1"
+        self.processor._vk_api_call = Mock(return_value={"items": [
+            self._msg(start_ts + 1, from_id=101, cmid=1, docs=[original + ".docx"]),
+            self._msg(start_ts + 2, from_id=101, cmid=2, docs=["Рерайт Иванов (2).docx"]),
+            self._msg(start_ts + 3, from_id=-500, cmid=3, docs=[incoming + ".pdf", "ИИ_" + incoming + ".pdf"]),
+        ]})
+        self.processor.generate_counter_report_simple = CounterModeProcessor.generate_counter_report_simple.__get__(self.processor)
+        self.processor.save_simple_report_to_file = AsyncMock()
+        with (
+            patch.object(self.processor, "_vk_counter_peer_ids_for_authors", return_value=["2000000002"]),
+            patch.object(self.processor, "_vk_local_counter_status_map", return_value={}),
+        ):
+            await self.processor.analyze_vk_files_history_auto("vk:101", date_str="2026-05-20")
+        self.processor.save_simple_report_to_file.assert_awaited_once()
+        sent, received, missing, *_ = self.processor.save_simple_report_to_file.await_args.args
+        self.assertEqual(2, len(sent))
+        self.assertEqual(1, len(received))
+        self.assertEqual(["Рерайт Иванов (2).docx"], [item["file_name"] for item in missing])
 
     async def test_vk_history_auto_retries_too_many_requests_and_continues(self):
         start_ts = int(datetime(2026, 5, 20, 0, 0).timestamp())
@@ -2866,6 +2888,34 @@ class TestAuthorCounter(unittest.IsolatedAsyncioTestCase):
         self.assertIn("b", received_names)
         self.assertIsNotNone(report_kwargs.get("end_dt"))
 
+    async def test_filename_variants_match_returns_without_losing_counts(self):
+        original = "Рерайт Иванов (1)"
+        incoming = "Рераи\u0306т_Иванов_1"
+        msgs = [
+            self._make_message(2002, original + ".docx", msg_id=1),
+            self._make_message(2002, original + ".docx", ts_offset=1, msg_id=2),
+            self._make_message(2002, "Рерайт Иванов (2).docx", ts_offset=2, msg_id=3),
+            self._make_message(3003, incoming + ".pdf", ts_offset=3, msg_id=4),
+            self._make_message(1001, incoming + ".pdf", ts_offset=4, msg_id=5),
+            self._make_message(1001, "ИИ_" + incoming + ".pdf", ts_offset=5, msg_id=6),
+        ]
+        manager = _make_account_manager()
+        client = AsyncMock()
+        client.me = SimpleNamespace(id=1001)
+        client.get_users.return_value = SimpleNamespace(id=2002, first_name="Author", last_name=None)
+        client.get_chat_history = lambda chat_id, limit=10000: _async_iter(msgs)
+        manager.get_client.return_value = client
+        processor = CounterModeProcessor(manager)
+        processor.save_simple_report_to_file = AsyncMock()
+        with patch("builtins.print"):
+            await processor.analyze_author_files_custom("@author", date_str="2024-03-15", start_file=incoming + ".docx")
+        processor.save_simple_report_to_file.assert_awaited_once()
+        sent, received, missing, *_ = processor.save_simple_report_to_file.await_args.args
+        self.assertEqual(3, len(sent))
+        self.assertEqual(1, len(received))
+        self.assertEqual({original + ".docx": 1, "Рерайт Иванов (2).docx": 1},
+                         {item["file_name"]: item["missing_count"] for item in missing})
+
 
 class TestEditorCounter(unittest.IsolatedAsyncioTestCase):
     """Tests for analyze_editor_files_custom."""
@@ -2923,6 +2973,28 @@ class TestEditorCounter(unittest.IsolatedAsyncioTestCase):
         sent, received, *_ = processor.generate_editor_report.await_args.args
         self.assertEqual(2, len(sent), "should count 2 files sent to editor")
         self.assertEqual(1, len(received), "should count 1 file received from editor")
+
+    async def test_editor_counter_filename_variants_preserve_job_ids(self):
+        msgs = [
+            self._make_message(1001, "Рерайт (1)__job10885.docx", msg_id=1),
+            self._make_message(1001, "Рерайт (1)__job10886.docx", ts_offset=1, msg_id=2),
+            self._make_message(2002, "Рераи\u0306т_1_job10885.pdf", ts_offset=2, msg_id=3),
+            self._make_message(2002, "ИИ_Рераи\u0306т_1_job10885.pdf", ts_offset=3, msg_id=4),
+            self._make_message(3003, "Рераи\u0306т_1_job10886.pdf", ts_offset=4, msg_id=5),
+        ]
+        manager = _make_account_manager()
+        client = AsyncMock()
+        client.me = SimpleNamespace(id=1001)
+        client.get_users.return_value = SimpleNamespace(id=2002, first_name="Editor", last_name=None)
+        client.get_chat_history = lambda chat_id, limit=10000: _async_iter(msgs)
+        manager.get_client.return_value = client
+        processor = CounterModeProcessor(manager)
+        with patch("builtins.print") as printed:
+            await processor.analyze_editor_files_custom("@editor", date_str="2024-03-15")
+        output = "\n".join(str(c.args[0]) for c in printed.call_args_list if c.args)
+        self.assertIn("Всего отправлено обычных файлов: 2 шт.", output)
+        self.assertIn("Не прислал обычных файлов: 1 шт.", output)
+        self.assertIn("Рерайт (1)__job10886.docx: отправлено 1, получено 0", output)
 
     async def test_editor_not_returned_is_correct(self):
         nik2_id = 1001
@@ -5323,6 +5395,25 @@ class TestAdditionalSenderSafety(unittest.TestCase):
 
 
 class TestAdditionalMode3FilenameNormalization(unittest.TestCase):
+    def test_unicode_separators_and_parentheses_equivalence(self):
+        key = CounterModeProcessor.normalize_filename
+        for left, right in (
+            ("Рерайт Иванов (1).docx", "Рераи\u0306т_Иванов_1.pdf"),
+            ("Рераи\u0306т  Иванов_1.pdf", "РерайтИванов(1).docx"),
+            ("Диплом (1)__job10885.docx", "Диплом_1_job10885.pdf"),
+        ):
+            with self.subTest(left=left, right=right):
+                self.assertEqual(key(left), key(right))
+        for left, right in (
+            ("Диплом (1).docx", "Диплом (2).pdf"),
+            ("Диплом_22_1.docx", "Диплом_23_1.pdf"),
+            ("Диплом Иванов.docx", "Диплом Петров.pdf"),
+            ("Диплом__job10885.docx", "Диплом_job10886.pdf"),
+            ("Диплом ①.docx", "Диплом 1.pdf"),
+        ):
+            with self.subTest(left=left, right=right):
+                self.assertNotEqual(key(left), key(right))
+
     def test_numeric_docx_normalizes_to_number(self):
         self.assertEqual("272727", CounterModeProcessor.normalize_filename("272727.docx"))
 
@@ -5333,7 +5424,7 @@ class TestAdditionalMode3FilenameNormalization(unittest.TestCase):
         self.assertEqual("272727", CounterModeProcessor.normalize_filename("272727.pdf"))
 
     def test_anti_suffix_is_preserved(self):
-        self.assertEqual("325451 анти", CounterModeProcessor.normalize_filename("325451 анти.docx"))
+        self.assertEqual("325451анти", CounterModeProcessor.normalize_filename("325451 анти.docx"))
 
     def test_vk_encoded_special_chars_are_stripped(self):
         self.assertEqual("temastest", CounterModeProcessor.normalize_filename("tema_39_s_34_test.docx"))

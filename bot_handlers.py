@@ -964,14 +964,18 @@ class CounterModeProcessor:
         # Убираем расширение
         name = os.path.splitext(filename)[0]
         # Приводим к нижнему регистру
-        name = name.lower().strip()
+        name = unicodedata.normalize("NFC", name).casefold().strip()
         # VK кодирует спецсимволы как _<decimal>_ (например ' → _39_, " → _34_)
         # Убираем такие вставки, чтобы сравнение шло по смыслу
         import re
-        name = re.sub(r"_\d{2,3}_", "", name)
+        name = re.sub(r"_(?:34|39)_", "", name)
         # Убираем оставшиеся апострофы и кавычки
         name = re.sub(r"['\"]", "", name)
-        return name
+        return re.sub(r"[\s_()]+", "", name)
+
+    @staticmethod
+    def _is_counter_ai_report(file_name):
+        return bool(re.match(r"^ии[\s_]+", str(file_name or "").strip(), flags=re.IGNORECASE))
 
     @classmethod
     def _counter_name_aliases(cls, file_name: str, message_text: str | None = None) -> list[str]:
@@ -1414,7 +1418,7 @@ class CounterModeProcessor:
                         continue
                     if self.processor.is_payment_document(file_name):
                         continue
-                    if self.processor.is_ai_report_filename(file_name):
+                    if self._is_counter_ai_report(file_name):
                         continue
                     normalized = self.normalize_filename(file_name)
                     aliases = self._counter_name_aliases(file_name, doc.get("message_text") or message.get("text"))
@@ -1450,7 +1454,7 @@ class CounterModeProcessor:
                     and file_name.lower().endswith(".pdf")
                     and sent_counts_seen.get(normalized, 0) > same_author_received_counts.get(normalized, 0)
                     and message_id_text not in same_author_sent_message_ids.get(normalized, set())
-                    and not self.processor.is_ai_report_filename(file_name)
+                    and not self._is_counter_ai_report(file_name)
                 ):
                     same_author_received_counts[normalized] = same_author_received_counts.get(normalized, 0) + 1
                     aliases = self._counter_name_aliases(file_name, doc.get("message_text") or message.get("text"))
@@ -2358,7 +2362,7 @@ class CounterModeProcessor:
                         continue
 
                     # ИИ-отчет — часть того же файла, не считаем отдельно
-                    if self.processor.is_ai_report_filename(file_name):
+                    if self._is_counter_ai_report(file_name):
                         continue
 
                     # Нормализуем имя файла (убираем .pdf)
