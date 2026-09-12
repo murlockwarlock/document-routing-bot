@@ -2854,8 +2854,8 @@ class BotHandlers:
         name = os.path.basename(str(file_name or ""))
         match = re.search(r"job[0-9]+\.[^.]+$", name)
         if not match:
-            return re.sub(r"[\s_]+", "", cls._editor_report_key(name))
-        return re.sub(r"[\s_]+", "", cls._editor_report_key(name[:match.start()])) + "__" + match.group().lower()
+            return re.sub(r"[\s_()]+", "", cls._editor_report_key(name))
+        return re.sub(r"[\s_()]+", "", cls._editor_report_key(name[:match.start()])) + "__" + match.group().lower()
 
     @classmethod
     def _editor_tracking_keys(cls, tracking_info: dict) -> set[str]:
