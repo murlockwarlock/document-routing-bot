@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import pymupdf
+
 from multichannel_gateway.tests import test_forced_author_routing as fixtures
 from multichannel_gateway.core.outbox import LocalOutboxSpool
 from multichannel_gateway.core.storage import SqliteJobStore
@@ -183,6 +185,204 @@ class ResultSafetyTests(unittest.IsolatedAsyncioTestCase):
                     self.h._mark_gateway_job_done.assert_awaited_once()
                     self.assertNotIn("B", self.h.current_processing_files)
                     self.h.manager.mark_account_free.assert_called_once()
+
+    def _plagiscan_success_with_url(self, info, *, ai=False):
+        message = self.response("unused")
+        message.document = None
+        message.text = "✅ Ваш файл успешно проверен!\nОригинальность: 75%"
+        main = SimpleNamespace(text="Посмотреть отчет", url="https://example.com/main.pdf")
+        buttons = [main]
+        if ai:
+            message.text += "\nМашинная генерация: 20%"
+            buttons.append(SimpleNamespace(text="Посмотреть отчет по ИИ", url="https://example.com/ai.pdf"))
+        message.reply_markup = SimpleNamespace(inline_keyboard=[buttons])
+        self.h.current_processing_files = {"B": info}
+        self.h.message_to_file_map = {"900_11": "B"}
+        return message
+
+    async def test_ai_url_report_is_delivered_without_crop_and_with_original_bytes(self):
+        info = self.anti_info()
+        info.update(main_report_delivered=True, awaiting_ai_report=True, force_plagiscan=True)
+        message = self._plagiscan_success_with_url(info, ai=True)
+        source = b"AI report bytes that must not be changed"
+        downloaded_paths = []
+
+        def download(_url, path):
+            downloaded_paths.append(path)
+            Path(path).write_bytes(source)
+            return True
+
+        async def deliver(_info, path, **_kwargs):
+            self.assertTrue(Path(path).exists())
+            self.assertEqual(source, Path(path).read_bytes())
+            return {"status": "sent"}
+
+        self.h.processor.download_pdf = download
+        self.h.processor.crop_pdf = Mock(side_effect=AssertionError("crop_pdf must not be called for AI report"))
+        self.h.processor.cleanup_temp_files = Mock()
+        self.h._deliver_document_to_origin = AsyncMock(side_effect=deliver)
+
+        await self.h.handle_anti_bot_response(self.client, message)
+
+        self.h.processor.crop_pdf.assert_not_called()
+        self.assertTrue(info["ai_report_delivered"])
+        self.assertTrue(info["main_report_delivered"])
+        delivery = self.h._deliver_document_to_origin.await_args
+        self.assertEqual("ИИ ДИПЛОМ.pdf", delivery.kwargs["file_name"])
+        self.assertEqual(source, Path(delivery.args[1]).read_bytes())
+        self.assertFalse(Path(downloaded_paths[0]).exists())
+
+    async def test_main_url_report_still_uses_crop(self):
+        info = self.anti_info()
+        message = self._plagiscan_success_with_url(info)
+        source = b"main source"
+        cropped = b"main cropped"
+
+        def download(_url, path):
+            Path(path).write_bytes(source)
+            return True
+
+        def crop(input_path, output_path):
+            Path(output_path).write_bytes(Path(input_path).read_bytes() + b" + " + cropped)
+            return True
+
+        self.h.processor.download_pdf = download
+        self.h.processor.crop_pdf = Mock(side_effect=crop)
+        self.h.processor.cleanup_temp_files = Mock()
+
+        await self.h.handle_anti_bot_response(self.client, message)
+
+        self.h.processor.crop_pdf.assert_called_once()
+        delivery = self.h._deliver_document_to_origin.await_args
+        self.assertEqual("ДИПЛОМ.pdf", delivery.kwargs["file_name"])
+        self.assertEqual(source + b" + " + cropped, Path(delivery.args[1]).read_bytes())
+        self.assertTrue(info["main_report_delivered"])
+        self.assertFalse(info.get("ai_report_delivered", False))
+
+    async def test_ai_direct_pdf_is_delivered_without_crop(self):
+        info = self.anti_info()
+        info.update(main_report_delivered=True, awaiting_ai_report=True, force_plagiscan=True)
+        message = self.response("ИИ ДИПЛОМ.pdf")
+        source = b"direct AI bytes"
+        downloaded_paths = []
+
+        async def download(path):
+            downloaded_paths.append(path)
+            Path(path).write_bytes(source)
+            return path
+
+        async def deliver(_info, path, **_kwargs):
+            self.assertTrue(Path(path).exists())
+            self.assertEqual(source, Path(path).read_bytes())
+            return {"status": "sent"}
+
+        message.download = download
+        self.h.current_processing_files = {"B": info}
+        self.h.message_to_file_map = {"900_11": "B"}
+        self.h.processor.crop_pdf = Mock(side_effect=AssertionError("crop_pdf must not be called for AI report"))
+        self.h.processor.cleanup_temp_files = Mock()
+        self.h._deliver_document_to_origin = AsyncMock(side_effect=deliver)
+
+        await self.h.handle_anti_bot_response(self.client, message)
+
+        self.h.processor.crop_pdf.assert_not_called()
+        self.assertTrue(info["ai_report_delivered"])
+        delivery = self.h._deliver_document_to_origin.await_args
+        self.assertEqual("ИИ ДИПЛОМ.pdf", delivery.kwargs["file_name"])
+        self.assertEqual(source, Path(delivery.args[1]).read_bytes())
+        self.assertFalse(Path(downloaded_paths[0]).exists())
+
+    async def test_ai_direct_pdf_keeps_valid_pdf_bytes_and_geometry(self):
+        info = self.anti_info()
+        info.update(main_report_delivered=True, awaiting_ai_report=True, force_plagiscan=True)
+        source_path = self.root / "ai-source.pdf"
+        document = pymupdf.open()
+        page = document.new_page(width=400, height=600)
+        page.insert_text((20, 70), "AI REPORT HEADER")
+        page.insert_text((20, 120), "IMPORTANT AI TEXT AT TOP")
+        page.insert_text((20, 300), "SECOND LINE")
+        document.save(source_path)
+        document.close()
+        source_bytes = source_path.read_bytes()
+        message = self.response("ИИ ДИПЛОМ.pdf")
+
+        async def download(path):
+            Path(path).write_bytes(source_bytes)
+            return path
+
+        async def deliver(_info, path, **_kwargs):
+            return {"status": "sent"}
+
+        message.download = download
+        self.h.current_processing_files = {"B": info}
+        self.h.message_to_file_map = {"900_11": "B"}
+        self.h.processor.crop_pdf = Mock(side_effect=AssertionError("crop_pdf must not be called for AI report"))
+        self.h.processor.cleanup_temp_files = Mock()
+        self.h._deliver_document_to_origin = AsyncMock(side_effect=deliver)
+
+        await self.h.handle_anti_bot_response(self.client, message)
+
+        delivered_path = self.h._deliver_document_to_origin.await_args.args[1]
+        self.assertEqual(source_bytes, Path(delivered_path).read_bytes())
+        delivered = pymupdf.open(delivered_path)
+        original = pymupdf.open(source_path)
+        self.assertEqual(len(original), len(delivered))
+        self.assertEqual(original[0].rect.width, delivered[0].rect.width)
+        self.assertEqual(original[0].rect.height, delivered[0].rect.height)
+        self.assertIn("IMPORTANT AI TEXT AT TOP", delivered[0].get_text())
+        delivered.close()
+        original.close()
+
+    async def test_main_direct_pdf_still_uses_crop(self):
+        info = self.anti_info()
+        message = self.response("ДИПЛОМ.pdf")
+        source = b"direct main source"
+        cropped = b"direct main cropped"
+
+        async def download(path):
+            Path(path).write_bytes(source)
+            return path
+
+        def crop(input_path, output_path):
+            Path(output_path).write_bytes(Path(input_path).read_bytes() + cropped)
+            return True
+
+        message.download = download
+        self.h.current_processing_files = {"B": info}
+        self.h.message_to_file_map = {"900_11": "B"}
+        self.h.processor.crop_pdf = Mock(side_effect=crop)
+        self.h.processor.cleanup_temp_files = Mock()
+
+        await self.h.handle_anti_bot_response(self.client, message)
+
+        self.h.processor.crop_pdf.assert_called_once()
+        delivery = self.h._deliver_document_to_origin.await_args
+        self.assertEqual("ДИПЛОМ.pdf", delivery.kwargs["file_name"])
+        self.assertEqual(source + cropped, Path(delivery.args[1]).read_bytes())
+        self.assertTrue(info["main_report_delivered"])
+
+    def test_main_crop_pdf_reduces_first_page(self):
+        import bot_handlers
+
+        source_path = self.root / "main-source.pdf"
+        cropped_path = self.root / "main-cropped.pdf"
+        document = pymupdf.open()
+        page = document.new_page(width=400, height=600)
+        page.insert_text((20, 70), "HEADER")
+        page.insert_text((20, 250), "RESULTS")
+        page.insert_text((20, 350), "BODY")
+        document.save(source_path)
+        document.close()
+
+        with patch.object(bot_handlers, "fitz", pymupdf):
+            self.assertTrue(self.h.processor.crop_pdf(str(source_path), str(cropped_path)))
+
+        original = pymupdf.open(source_path)
+        cropped = pymupdf.open(cropped_path)
+        self.assertLess(cropped[0].rect.height, original[0].rect.height)
+        self.assertIn("BODY", cropped[0].get_text())
+        original.close()
+        cropped.close()
 
     async def test_main_sent_ai_spooled_retries_only_ai(self):
         info = self.anti_info()

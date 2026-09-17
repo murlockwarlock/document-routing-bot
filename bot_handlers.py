@@ -6250,12 +6250,15 @@ class BotHandlers:
                 temp_files_to_cleanup.append(temp_pdf)
 
                 if await self._run_blocking(self.processor.download_pdf, report_url, temp_pdf):
-                    # ОБРЕЗАЕМ PDF как и для обычных отчетов
-                    cropped_pdf = self._build_result_file_path(f"cropped_{os.path.basename(temp_pdf)}")
-                    temp_files_to_cleanup.append(cropped_pdf)
+                    if report_kind == "ai":
+                        cropped_pdf = temp_pdf
+                        crop_succeeded = True
+                    else:
+                        cropped_pdf = self._build_result_file_path(f"cropped_{os.path.basename(temp_pdf)}")
+                        temp_files_to_cleanup.append(cropped_pdf)
+                        crop_succeeded = await self._run_blocking(self.processor.crop_pdf, temp_pdf, cropped_pdf)
 
-                    if await self._run_blocking(self.processor.crop_pdf, temp_pdf, cropped_pdf):
-                        # Сохраняем с оригинальным именем файла
+                    if crop_succeeded:
                         original_name_without_ext = os.path.splitext(processing_info['original_file_name'])[0]
                         final_name = (
                             f"ИИ {original_name_without_ext}.pdf"
@@ -6473,14 +6476,16 @@ class BotHandlers:
                 )
                 final_path = self._build_result_file_path(final_name)
 
-                # Обрезаем PDF
-                if await self._run_blocking(self.processor.crop_pdf, temp_pdf, final_path):
-                    print(f"✅ PDF антиплагиата обрезан: {final_path}")
+                if report_kind == "ai":
+                    os.rename(temp_pdf, final_path)
+                    print(f"✅ PDF ИИ-отчета сохранен без изменений: {final_path}")
                 else:
-                    # Если не удалось обрезать, просто копируем
-                    import shutil
-                    shutil.copy2(temp_pdf, final_path)
-                    print(f"⚠️  PDF антиплагиата не обрезан, сохранен как: {final_path}")
+                    if await self._run_blocking(self.processor.crop_pdf, temp_pdf, final_path):
+                        print(f"✅ PDF антиплагиата обрезан: {final_path}")
+                    else:
+                        import shutil
+                        shutil.copy2(temp_pdf, final_path)
+                        print(f"⚠️  PDF антиплагиата не обрезан, сохранен как: {final_path}")
 
                 temp_files_to_cleanup.append(final_path)
 
