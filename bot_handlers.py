@@ -3961,8 +3961,8 @@ class BotHandlers:
 
         return False
 
-    def is_explicit_allowed_author(self, username):
-        """True только если username явно указан в allowed_authors."""
+    def is_explicit_allowed_author(self, username, author_id=None):
+        """True только если username или Telegram id явно указан в allowed_authors."""
         allowed_authors = Config.get_setting("allowed_authors", [])
         if not allowed_authors:
             return False
@@ -3971,6 +3971,8 @@ class BotHandlers:
         for entry in allowed_authors:
             entry_clean = str(entry).lstrip("@")
             if entry_clean.lower() == username_clean.lower():
+                return True
+            if author_id is not None and entry_clean == str(author_id):
                 return True
         return False
 
@@ -4211,12 +4213,6 @@ class BotHandlers:
             if tracking_key is None and "нет ожидающих задач" not in str(match_reason):
                 print(f"⚠️ PDF от редактора {author} не привязан: {message.document.file_name}, {match_reason}")
 
-        # Telegram-бот с документом может быть явным разрешенным автором.
-        # Тогда принимаем файл как входящий, а не как сервисный ответ от бота.
-        if self.is_bot_message(author) and not self.is_explicit_allowed_author(author):
-            await self.handle_bot_response(client, message)
-            return
-
         route_context = {
             "author": author,
             "author_id": message.from_user.id,
@@ -4225,6 +4221,16 @@ class BotHandlers:
             "route_message_id": message.id,
             "route_is_group": self._is_telegram_group_message(message),
         }
+
+        # Telegram-бот с документом может быть явным разрешенным автором.
+        # Тогда принимаем файл как входящий, а не как сервисный ответ от бота.
+        if self.is_bot_message(author) and not (
+            self.is_explicit_allowed_author(author, message.from_user.id)
+            or self.is_force_plagiscan_author(author=author, author_id=message.from_user.id)
+            or self._telegram_group_route_for_file_info(route_context)
+        ):
+            await self.handle_bot_response(client, message)
+            return
 
         # Проверяем разрешен ли автор
         if not self.is_author_allowed(

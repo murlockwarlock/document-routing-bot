@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+import pytest
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -99,6 +100,74 @@ def telegram_file_info(author, author_id, file_name, *, chat_id=None, message_id
         "local_path": None,
         "gateway_job_id": None,
     }
+
+
+@pytest.mark.parametrize(
+    "username,overrides,chat_type,expected_route,service",
+    [
+        ("sender_bot", {"plagiscan_users": ["@sender_bot"]}, "private", {"destination": "plagiscan"}, None),
+        ("sender_bot", {"plagiscan_users": ["42"]}, "private", {"destination": "plagiscan"}, None),
+        ("sender_bot", {"allowed_authors": ["@SENDER_BOT"]}, "private", None, None),
+        ("sender_bot", {"allowed_authors": ["42"]}, "private", None, None),
+        ("sender_bot", {"allowed_authors": [42]}, "private", None, None),
+        ("sender_bot", {"telegram_group_routes": {"-100123": {"destination": "editor", "editor_nickname": "@group-editor"}}}, "supergroup", {"destination": "editor", "editor_nickname": "@group-editor", "scope": "telegram_group"}, None),
+        ("sender_bot", {"plagiscan_users": ["sender_bot"], "allowed_authors": ["sender_bot"], "telegram_group_routes": {"-100123": {"destination": "editor", "editor_nickname": "@group-editor"}}}, "group", {"destination": "editor", "editor_nickname": "@group-editor", "scope": "telegram_group"}, None),
+        ("sender_bot", {"plagiscan_users": ["sender_bot"], "allowed_authors": ["sender_bot"], "forced_authors_destination": "editor", "forced_authors_editor_nickname": "@forced-editor"}, "private", {"destination": "editor", "editor_nickname": "@forced-editor"}, None),
+        ("sender_bot", {}, "private", None, "unknown"),
+        ("sender_bot", {"allowed_authors": []}, "private", None, "unknown"),
+        ("sender_bot", {"plagiscan_users": ["vk:42"]}, "private", None, "unknown"),
+        ("sender_bot", {"telegram_group_routes": {"42": {"destination": "plagiscan"}}}, "private", None, "unknown"),
+        ("plagiscan_bot", {}, "private", None, "anti"),
+        ("AAA_Report_AIBot", {}, "private", None, "ai"),
+        ("author", {"allowed_authors": ["author"]}, "private", None, None),
+    ],
+    ids=["forced-username", "forced-id", "allowed-username", "allowed-id-string", "allowed-id-int", "group", "group-before-forced", "forced-before-ordinary", "unknown", "unknown-open-list", "vk-not-telegram", "private-not-group", "anti-service", "ai-service", "ordinary-user"],
+)
+def test_main_account_bot_document_authorization(username, overrides, chat_type, expected_route, service):
+    handlers = make_handlers()
+    handlers.process_queue = AsyncMock()
+    handlers.handle_ai_bot_response = AsyncMock()
+    handlers.handle_anti_bot_response = AsyncMock()
+    handlers.handle_bot_response = AsyncMock(wraps=handlers.handle_bot_response)
+    chat_id = 42 if chat_type == "private" else -100123
+    message = SimpleNamespace(
+        id=777,
+        chat=SimpleNamespace(id=chat_id, type=chat_type),
+        from_user=SimpleNamespace(id=42, username=username, is_bot=username != "author"),
+        document=SimpleNamespace(file_name="paper.docx", mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        text=None,
+        reply_to_message_id=None,
+    )
+    client = SimpleNamespace(name="НИК-1")
+    ingest_job = SimpleNamespace(job_id=77, file_path="/tmp/paper.docx", dedupe_key=f"telegram:{chat_id}:777:0")
+    settings = base_settings([], allowed_authors=["other-author"])
+    settings.update(overrides)
+    try:
+        with patch("bot_handlers.Config.get_setting", side_effect=settings_lookup(settings)), patch(
+            "bot_handlers.ingest_pyrogram_message", new=AsyncMock(return_value=[ingest_job])
+        ) as ingest:
+            asyncio.run(handlers.handle_main_account(client, message))
+
+        if service:
+            ingest.assert_not_awaited()
+            assert handlers.manager.file_queue == []
+            handlers.handle_bot_response.assert_awaited_once_with(client, message)
+        else:
+            ingest.assert_awaited_once_with(message)
+            handlers.handle_bot_response.assert_not_awaited()
+            assert len(handlers.manager.file_queue) == 1
+            queued = handlers.manager.file_queue[0]
+            assert queued["forced_route"] == expected_route
+            assert queued["force_plagiscan"] == bool(expected_route and expected_route["destination"] == "plagiscan")
+            assert queued["route_chat_id"] == chat_id
+            assert queued["gateway_job_id"] == 77
+        for kind, handler in (("ai", handlers.handle_ai_bot_response), ("anti", handlers.handle_anti_bot_response)):
+            if service == kind:
+                handler.assert_awaited_once_with(client, message)
+            else:
+                handler.assert_not_awaited()
+    finally:
+        handlers._safety_test_dir.cleanup()
 
 
 class TestForcedAuthorRouting(unittest.TestCase):
