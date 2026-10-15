@@ -106,6 +106,60 @@ class RestartSemanticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((-100123, 1), (sent["chat_id"], sent["reply_to_message_id"]))
         self.assertEqual(1, bot.handlers.files_today["count"])
 
+    async def test_dotted_editor_reports_return_to_origin_and_persist_completion(self):
+        cases = (
+            ("Статья_Надежность_АСТД_15.10.2026", "Статья_Надежность_АСТД_15_10_2026"),
+            ("Статья Обрат.Сторона Прозрачн.", "Статья_Обрат_Сторона_Прозрачн"),
+        )
+        for index, (original, returned) in enumerate(cases, 1):
+            with self.subTest(original=original):
+                bot = self.bot()
+                with patch.object(bot.handlers, "_log_editor") as log:
+                    await bot.handlers.handle_main_account(
+                        bot.manager.clients["НИК-1"], self.source(index, original + ".docx"),
+                    )
+                info = next(iter(bot.handlers.editor_tracking.values()))
+                job = info["gateway_job_id"]
+                self.assertEqual("awaiting_editor", self.store.get_job(job).status)
+                self.assertTrue(any(info["expected_pdf_name"] in str(call) for call in log.call_args_list))
+                client = bot.manager.clients["НИК-1"]
+                for count, ai in enumerate((False, True), 1):
+                    name = f"{'ИИ_' if ai else ''}{returned}_job{job}.pdf"
+                    message = self.report(name=name)
+                    message.id = 800 + count
+                    key, matched, reason = bot.handlers.find_editor_tracking_for_unreplied_pdf(
+                        "editor", name, sent_from_account="НИК-2", reply_chat_id=900,
+                    )
+                    self.assertIs(info, matched, reason)
+                    await bot.handlers.handle_editor_response(
+                        bot.manager.clients["НИК-2"], message,
+                        resolved_reply_to_message_id=matched["reply_to_message_id"],
+                    )
+                    self.assertEqual(count, client.send_document.await_count)
+                    sent = client.send_document.await_args.kwargs
+                    self.assertEqual((-100123, index), (sent["chat_id"], sent["reply_to_message_id"]))
+                    self.assertEqual(f"{'ИИ ' if ai else ''}{original}.pdf", sent["file_name"])
+                    self.assertEqual("done", SqliteJobStore(self.store.db_path).get_job(job).status)
+                    duplicate = self.report(name=name)
+                    duplicate.id = 900 + count
+                    await bot.handlers.handle_editor_response(bot.manager.clients["НИК-2"], duplicate)
+                    self.assertEqual(count, client.send_document.await_count)
+                self.assertEqual({}, bot.handlers.editor_tracking)
+
+    async def test_plain_report_can_have_no_candidates_while_job_is_waiting(self):
+        bot = self.bot()
+        original = "Топологическое_письмо_субъекта_ПРЕДВАРИТЕЛЬНАЯ_тестовая_финальная.pdf"
+        await bot.handlers.handle_main_account(bot.manager.clients["НИК-1"], self.source(name=original))
+        info = next(iter(bot.handlers.editor_tracking.values()))
+        self.assertEqual("awaiting_editor", self.store.get_job(info["gateway_job_id"]).status)
+        result = bot.handlers.find_editor_tracking_for_unreplied_pdf("editor", original, reply_chat_id=900)
+        self.assertEqual((None, None, "нет ожидающих задач"), result)
+        self.assertEqual(1, len(bot.handlers.editor_tracking))
+        await bot.handlers.handle_editor_response(
+            bot.manager.clients["НИК-2"], self.report(reply=info["reply_to_message_id"], name=original),
+        )
+        bot.manager.clients["НИК-1"].send_document.assert_awaited_once()
+
     async def test_old_editor_waiting_response_cannot_select_new_same_name(self):
         old = self.bot()
         await old.handlers.handle_main_account(old.manager.clients["НИК-1"], self.source())

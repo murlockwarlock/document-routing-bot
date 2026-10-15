@@ -2680,6 +2680,40 @@ class BotHandlers:
     def _log_editor(message):
         append_channel_log("editor", message)
 
+    def _editor_trace(self, event, **fields):
+        parts = [f"EDITOR_TRACE event={event}"]
+        for key, value in fields.items():
+            parts.append(f"{key}={value!r}")
+        line = " ".join(parts)
+        print(line, flush=True)
+        self._log_editor(line)
+
+    @staticmethod
+    def _editor_tracking_summary(key, info):
+        return {
+            "key": str(key),
+            "job_id": info.get("editor_job_id"),
+            "gateway_job_id": info.get("gateway_job_id"),
+            "original_file_name": info.get("original_file_name") or info.get("original_name"),
+            "transport_file_name": info.get("transport_file_name"),
+            "expected_pdf_name": info.get("expected_pdf_name"),
+            "expected_ai_pdf_name": info.get("expected_ai_pdf_name"),
+            "destination": info.get("destination"),
+            "sent_from_account": info.get("sent_from_account"),
+            "chat_id": info.get("chat_id"),
+            "message_id": info.get("message_id"),
+            "reply_to_message_id": info.get("reply_to_message_id"),
+            "lifecycle": info.get("lifecycle"),
+            "normal_report_delivered": info.get("normal_report_delivered"),
+            "ai_report_delivered": info.get("ai_report_delivered"),
+        }
+
+    def _editor_tracking_snapshot(self):
+        return [
+            self._editor_tracking_summary(key, info)
+            for key, info in self.editor_tracking.items()
+        ]
+
     @staticmethod
     def _log_gateway(message):
         append_channel_log("gateway", message)
@@ -2859,7 +2893,7 @@ class BotHandlers:
         match = re.search(r"job[0-9]+\.[^.]+$", name)
         if not match:
             return re.sub(r"[\s_()]+", "", cls._editor_report_key(name))
-        return re.sub(r"[\s_()]+", "", cls._editor_report_key(name[:match.start()])) + "__" + match.group().lower()
+        return re.sub(r"[\s_.()]+", "", cls._editor_report_key(name[:match.start()])) + "__" + match.group().lower()
 
     @classmethod
     def _editor_tracking_keys(cls, tracking_info: dict) -> set[str]:
@@ -2935,6 +2969,18 @@ class BotHandlers:
     def _warn_unknown_editor_response(self, message, reply_to_message_id):
         self._cleanup_editor_response_state()
         identity = self._editor_response_identity(message)
+        document = getattr(message, "document", None)
+        self._editor_trace(
+            "response_unmatched",
+            reason="unknown_editor_response",
+            message_id=getattr(message, "id", None),
+            incoming_file_name=getattr(document, "file_name", None),
+            sender=getattr(getattr(message, "from_user", None), "username", None),
+            sender_id=getattr(getattr(message, "from_user", None), "id", None),
+            chat_id=getattr(getattr(message, "chat", None), "id", None),
+            reply_to_message_id=reply_to_message_id,
+            tracking_snapshot=self._editor_tracking_snapshot(),
+        )
         if identity is not None and identity in self._editor_response_unknown_warnings:
             return
         if identity is not None:
@@ -3064,10 +3110,60 @@ class BotHandlers:
             info["editor_job_id"] = int(job_id) if isinstance(job_id, (int, str)) and str(job_id).isdigit() and int(job_id) > 0 else uuid.uuid4().int
         stem, extension = os.path.splitext(os.path.basename(original))
         info["transport_file_name"] = f"{stem}__job{info['editor_job_id']}{extension}"
-        return await client.send_document(chat_id=destination, document=path, file_name=info["transport_file_name"])
+        upload_path = path
+        upload_dir = None
+        try:
+            if os.path.isfile(path) and os.path.basename(path) != info["transport_file_name"]:
+                upload_dir = tempfile.mkdtemp(prefix="editor-upload-")
+                upload_path = os.path.join(upload_dir, info["transport_file_name"])
+                shutil.copy2(path, upload_path)
+            self._editor_trace(
+                "send_start",
+                account=getattr(client, "name", None),
+                destination=destination,
+                job_id=info.get("editor_job_id"),
+                gateway_job_id=info.get("gateway_job_id"),
+                original_file_name=original,
+                requested_file_name=info["transport_file_name"],
+                local_file_name=os.path.basename(path),
+                upload_file_name=os.path.basename(upload_path),
+                renamed_upload=upload_path != path,
+            )
+            sent_message = await client.send_document(
+                chat_id=destination,
+                document=upload_path,
+                file_name=info["transport_file_name"],
+            )
+            sent_document = getattr(sent_message, "document", None)
+            self._editor_trace(
+                "send_result",
+                account=getattr(client, "name", None),
+                destination=destination,
+                job_id=info.get("editor_job_id"),
+                gateway_job_id=info.get("gateway_job_id"),
+                message_id=getattr(sent_message, "id", None),
+                chat_id=getattr(getattr(sent_message, "chat", None), "id", None),
+                requested_file_name=info["transport_file_name"],
+                telegram_file_name=getattr(sent_document, "file_name", None),
+                telegram_mime_type=getattr(sent_document, "mime_type", None),
+                telegram_file_size=getattr(sent_document, "file_size", None),
+                local_file_name=os.path.basename(path),
+                upload_file_name=os.path.basename(upload_path),
+                renamed_upload=upload_path != path,
+            )
+            return sent_message
+        finally:
+            if upload_dir:
+                try:
+                    os.unlink(upload_path)
+                except FileNotFoundError:
+                    pass
+                try:
+                    os.rmdir(upload_dir)
+                except OSError:
+                    pass
 
-    @staticmethod
-    def _attach_editor_assignment(tracking, source):
+    def _attach_editor_assignment(self, tracking, source):
         tracking.update(
             file_uid=source.get("file_uid"),
             editor_job_id=source["editor_job_id"],
@@ -3078,6 +3174,21 @@ class BotHandlers:
             expected_ai_pdf_name="ИИ " + os.path.splitext(source["transport_file_name"])[0] + ".pdf",
             delivered_reports=set(), normal_report_delivered=False, ai_report_delivered=False,
             first_report_at=None, lifecycle="waiting_first_report", account_released=True,
+        )
+        self._editor_trace(
+            "assignment_registered",
+            job_id=tracking.get("editor_job_id"),
+            gateway_job_id=tracking.get("gateway_job_id"),
+            original_file_name=tracking.get("original_file_name"),
+            transport_file_name=tracking.get("transport_file_name"),
+            expected_pdf_name=tracking.get("expected_pdf_name"),
+            expected_ai_pdf_name=tracking.get("expected_ai_pdf_name"),
+            destination=tracking.get("destination"),
+            sent_from_account=tracking.get("sent_from_account"),
+            sent_message_id=tracking.get("message_id"),
+            sent_chat_id=tracking.get("chat_id"),
+            reply_to_message_id=tracking.get("reply_to_message_id"),
+            source_file_uid=tracking.get("file_uid"),
         )
 
     def _expire_editor_assignments(self, now=None):
@@ -3091,22 +3202,83 @@ class BotHandlers:
     def _find_token_editor_assignment(self, sender, file_name, account, chat_id, reply_id=None):
         self._expire_editor_assignments()
         job_id = self._editor_job_token(file_name)
+        self._editor_trace(
+            "token_match_start",
+            incoming_file_name=file_name,
+            parsed_job_id=job_id,
+            sender=sender,
+            sent_from_account=account,
+            chat_id=chat_id,
+            reply_to_message_id=reply_id,
+            tracking_count=len(self.editor_tracking),
+        )
         if job_id is None:
+            self._editor_trace("token_match_rejected", reason="malformed editor job token", incoming_file_name=file_name)
             return None, None, "malformed editor job token"
         matches = [(key, info) for key, info in self.editor_tracking.items()
                    if info.get("editor_job_id") == job_id and info.get("sent_from_account") == account]
         if len(matches) != 1:
+            self._editor_trace(
+                "token_match_rejected",
+                reason="unknown, expired or ambiguous editor job",
+                parsed_job_id=job_id,
+                match_count=len(matches),
+                matching_tasks=[self._editor_tracking_summary(key, info) for key, info in matches],
+                tracking_snapshot=self._editor_tracking_snapshot(),
+            )
             return None, None, f"unknown, expired or ambiguous editor job {job_id}"
         key, info = matches[0]
         if self._normalize_editor_destination(sender) != self._normalize_editor_destination(info.get("destination")):
+            self._editor_trace(
+                "token_match_rejected",
+                reason="editor job sender mismatch",
+                parsed_job_id=job_id,
+                incoming_sender=sender,
+                expected_sender=info.get("destination"),
+                task=self._editor_tracking_summary(key, info),
+            )
             return None, None, "editor job sender mismatch"
         if info.get("chat_id") is not None and str(info["chat_id"]) != str(chat_id):
+            self._editor_trace(
+                "token_match_rejected",
+                reason="editor job chat mismatch",
+                parsed_job_id=job_id,
+                incoming_chat_id=chat_id,
+                expected_chat_id=info.get("chat_id"),
+                task=self._editor_tracking_summary(key, info),
+            )
             return None, None, "editor job chat mismatch"
         if reply_id is not None and reply_id != info.get("reply_to_message_id"):
+            self._editor_trace(
+                "token_match_rejected",
+                reason="editor job token/reply conflict",
+                parsed_job_id=job_id,
+                incoming_reply_to_message_id=reply_id,
+                expected_reply_to_message_id=info.get("reply_to_message_id"),
+                task=self._editor_tracking_summary(key, info),
+            )
             return None, None, "editor job token/reply conflict"
         expected = {self._editor_assignment_report_key(info["expected_pdf_name"]), self._editor_assignment_report_key(info["expected_ai_pdf_name"])}
-        if self._editor_assignment_report_key(file_name) not in expected:
+        incoming_key = self._editor_assignment_report_key(file_name)
+        if incoming_key not in expected:
+            self._editor_trace(
+                "token_match_rejected",
+                reason="editor job report name mismatch",
+                parsed_job_id=job_id,
+                incoming_file_name=file_name,
+                expected_file_names=[info["expected_pdf_name"], info["expected_ai_pdf_name"]],
+                incoming_key=incoming_key,
+                expected_keys=sorted(expected),
+                task=self._editor_tracking_summary(key, info),
+            )
             return None, None, "editor job report name mismatch"
+        self._editor_trace(
+            "token_match_success",
+            parsed_job_id=job_id,
+            incoming_file_name=file_name,
+            tracking_key=key,
+            task=self._editor_tracking_summary(key, info),
+        )
         return key, info, f"exact editor job {job_id}"
 
     def _editor_client_report_name(self, info, incoming_name):
@@ -3131,7 +3303,17 @@ class BotHandlers:
         reply_chat_id=None,
     ):
         self._expire_editor_assignments()
-        if self._has_editor_job_marker(doc_name):
+        has_job_marker = self._has_editor_job_marker(doc_name)
+        self._editor_trace(
+            "unreplied_match_start",
+            incoming_file_name=doc_name,
+            has_job_marker=has_job_marker,
+            sender=sender,
+            sent_from_account=sent_from_account,
+            reply_chat_id=reply_chat_id,
+            tracking_count=len(self.editor_tracking),
+        )
+        if has_job_marker:
             return self._find_token_editor_assignment(sender, doc_name, sent_from_account, reply_chat_id)
         sender_clean = str(sender or "").replace("@", "").lower()
         candidates = [
@@ -3146,7 +3328,19 @@ class BotHandlers:
             )
             and self._editor_report_is_pending(doc_name, info)
         ]
+        self._editor_trace(
+            "unreplied_match_candidates",
+            incoming_file_name=doc_name,
+            candidate_count=len(candidates),
+            candidates=[self._editor_tracking_summary(key, info) for key, info in candidates],
+        )
         if not candidates:
+            self._editor_trace(
+                "unreplied_match_rejected",
+                reason="нет ожидающих задач",
+                incoming_file_name=doc_name,
+                tracking_snapshot=self._editor_tracking_snapshot(),
+            )
             return None, None, "нет ожидающих задач"
         matches = [
             (key, info)
@@ -3171,10 +3365,38 @@ class BotHandlers:
                 and self._editor_tracking_matches_file(doc_name, info)
             ]
             if completed_conflicts:
+                self._editor_trace(
+                    "unreplied_match_rejected",
+                    reason="неоднозначное имя файла: есть недавно завершенная задача",
+                    incoming_file_name=doc_name,
+                    task=self._editor_tracking_summary(matched_key, matched_info),
+                    completed_conflicts=[self._editor_tracking_summary(key, info) for key, info in self.editor_tracking.items()
+                                         if info in completed_conflicts],
+                )
                 return None, None, f"неоднозначное имя файла: {doc_name} (есть недавно завершенная задача)"
+            self._editor_trace(
+                "unreplied_match_success",
+                reason="точное совпадение имени файла",
+                incoming_file_name=doc_name,
+                tracking_key=matched_key,
+                task=self._editor_tracking_summary(matched_key, matched_info),
+            )
             return matched_key, matched_info, "точное совпадение имени файла"
         if len(matches) > 1:
+            self._editor_trace(
+                "unreplied_match_rejected",
+                reason="неоднозначное имя файла",
+                incoming_file_name=doc_name,
+                match_count=len(matches),
+                matching_tasks=[self._editor_tracking_summary(key, info) for key, info in matches],
+            )
             return None, None, f"неоднозначное имя файла: {doc_name}"
+        self._editor_trace(
+            "unreplied_match_rejected",
+            reason="нет точного совпадения имени файла",
+            incoming_file_name=doc_name,
+            candidate_tasks=[self._editor_tracking_summary(key, info) for key, info in candidates],
+        )
         return None, None, f"нет точного совпадения имени файла: {doc_name}"
 
     def find_editor_tracking_for_text_response(
@@ -4542,8 +4764,9 @@ class BotHandlers:
             if file_info:
                 await self._mark_gateway_job_waiting_editor(file_info, "waiting_editor247_response")
 
-            print(f"📝 Ожидаю PDF файл: {original_name_without_ext}.pdf от круглосуточного редактора")
-            self._log_editor(f"📝 Ожидаю PDF файл: {original_name_without_ext}.pdf от круглосуточного редактора")
+            expected_pdf_name = self.editor_tracking[tracking_key]["expected_pdf_name"]
+            print(f"📝 Ожидаю PDF файл: {expected_pdf_name} от круглосуточного редактора")
+            self._log_editor(f"📝 Ожидаю PDF файл: {expected_pdf_name} от круглосуточного редактора")
 
             # Удаляем временный файл
             if os.path.exists(temp_path):
@@ -4831,9 +5054,10 @@ class BotHandlers:
                 await self._mark_gateway_job_waiting_editor(file_info, "waiting_anti_editor_response")
 
                 print(f"✅ Анти-файл отправлен редактору {destination} через НИК-2. ID сообщения: {sent_msg.id}")
-                print(f"📝 Ожидаю PDF файл: {original_name_without_ext}.pdf от редактора в НИК-2")
+                expected_pdf_name = self.editor_tracking[tracking_key]["expected_pdf_name"]
+                print(f"📝 Ожидаю PDF файл: {expected_pdf_name} от редактора в НИК-2")
                 self._log_editor(f"✅ Анти-файл отправлен редактору {destination} через НИК-2. ID сообщения: {sent_msg.id}")
-                self._log_editor(f"📝 Ожидаю PDF файл: {original_name_without_ext}.pdf от редактора в НИК-2")
+                self._log_editor(f"📝 Ожидаю PDF файл: {expected_pdf_name} от редактора в НИК-2")
 
             else:
                 self.current_processing_files[file_key] = {
@@ -5222,9 +5446,10 @@ class BotHandlers:
                     )
 
                     print(f"✅ Файл отправлен редактору {destination}. ID сообщения: {sent_msg.id}")
-                    print(f"📝 Ожидаю PDF файл: {original_name_without_ext}.pdf от редактора")
+                    expected_pdf_name = self.editor_tracking[tracking_key]["expected_pdf_name"]
+                    print(f"📝 Ожидаю PDF файл: {expected_pdf_name} от редактора")
                     self._log_editor(f"✅ Файл отправлен редактору {destination}. ID сообщения: {sent_msg.id}")
-                    self._log_editor(f"📝 Ожидаю PDF файл: {original_name_without_ext}.pdf от редактора")
+                    self._log_editor(f"📝 Ожидаю PDF файл: {expected_pdf_name} от редактора")
 
             else:
                 editor_nickname = (
@@ -5298,9 +5523,10 @@ class BotHandlers:
                     )
 
                     print(f"✅ Файл отправлен редактору {destination}. ID сообщения: {sent_msg.id}")
-                    print(f"📝 Ожидаю PDF файл: {original_name_without_ext}.pdf от редактора")
+                    expected_pdf_name = self.editor_tracking[tracking_key]["expected_pdf_name"]
+                    print(f"📝 Ожидаю PDF файл: {expected_pdf_name} от редактора")
                     self._log_editor(f"✅ Файл отправлен редактору {destination}. ID сообщения: {sent_msg.id}")
-                    self._log_editor(f"📝 Ожидаю PDF файл: {original_name_without_ext}.pdf от редактора")
+                    self._log_editor(f"📝 Ожидаю PDF файл: {expected_pdf_name} от редактора")
 
                 else:
                     print("❌ Редактор не настроен (editor_nickname). Файл не отправлен.")
@@ -5317,30 +5543,85 @@ class BotHandlers:
         """Обработка ответов от редактора (PDF файлов) для НИК-2"""
         response_claim_key = None
         response_accepted = False
+        message_document = getattr(message, "document", None)
+        incoming_name = getattr(message_document, "file_name", "") or ""
+        incoming_sender_user = getattr(message, "from_user", None)
+        incoming_sender = (
+            getattr(incoming_sender_user, "username", None)
+            or str(getattr(incoming_sender_user, "id", ""))
+            if incoming_sender_user
+            else ""
+        )
+        incoming_sender_id = getattr(incoming_sender_user, "id", None)
+        incoming_chat_id = getattr(getattr(message, "chat", None), "id", None)
+        incoming_reply_id = getattr(message, "reply_to_message_id", None)
+        client_name = getattr(client, "name", None)
+        self._editor_trace(
+            "response_received",
+            account=client_name,
+            message_id=getattr(message, "id", None),
+            incoming_file_name=incoming_name or None,
+            incoming_mime_type=getattr(message_document, "mime_type", None),
+            incoming_file_size=getattr(message_document, "file_size", None),
+            sender=incoming_sender,
+            sender_id=incoming_sender_id,
+            chat_id=incoming_chat_id,
+            reply_to_message_id=incoming_reply_id,
+            resolved_reply_to_message_id=resolved_reply_to_message_id,
+            has_document=bool(message_document),
+            has_text=bool(getattr(message, "text", None)),
+        )
         try:
             if self._editor_response_was_claimed(message):
+                self._editor_trace(
+                    "response_ignored",
+                    reason="duplicate_response_claim",
+                    message_id=getattr(message, "id", None),
+                    incoming_file_name=incoming_name or None,
+                )
                 return
-            effective_reply_id = resolved_reply_to_message_id or getattr(message, "reply_to_message_id", None)
-            message_chat_id = getattr(getattr(message, "chat", None), "id", None)
+            effective_reply_id = resolved_reply_to_message_id or incoming_reply_id
+            message_chat_id = incoming_chat_id
             tracking_key = None
+            tracking_info = None
+            correlation_reason = "not_matched"
             self._expire_editor_assignments()
-            incoming_name = getattr(getattr(message, "document", None), "file_name", "") or ""
             token_response = self._has_editor_job_marker(incoming_name)
             if token_response:
-                sender = message.from_user.username or str(message.from_user.id) if getattr(message, "from_user", None) else ""
                 tracking_key, tracking_info, reason = self._find_token_editor_assignment(
-                    sender, incoming_name, client.name, message_chat_id, getattr(message, "reply_to_message_id", None),
+                    incoming_sender, incoming_name, client_name, message_chat_id, incoming_reply_id,
+                )
+                correlation_reason = reason
+                self._editor_trace(
+                    "correlation_result",
+                    method="job_token",
+                    reason=reason,
+                    tracking_key=tracking_key,
+                    incoming_file_name=incoming_name,
+                    task=self._editor_tracking_summary(tracking_key, tracking_info) if tracking_info else None,
                 )
                 if tracking_info is None:
                     self._log_editor(f"Editor correlation stopped: {reason}")
                     print(f"Editor correlation stopped: {reason}")
                     return
                 effective_reply_id = tracking_info.get("reply_to_message_id")
-            elif client.name != "НИК-2":
+            elif client_name != "НИК-2":
                 # Если это не НИК-2, проверяем стандартное отслеживание
                 tracking_info = self.editor_tracking.get(effective_reply_id)
                 if tracking_info:
                     tracking_key = effective_reply_id
+                    correlation_reason = "reply_tracking"
+                else:
+                    correlation_reason = "reply_tracking_not_found"
+                self._editor_trace(
+                    "correlation_result",
+                    method="reply_tracking",
+                    reason=correlation_reason,
+                    tracking_key=tracking_key,
+                    incoming_file_name=incoming_name or None,
+                    reply_to_message_id=effective_reply_id,
+                    task=self._editor_tracking_summary(tracking_key, tracking_info) if tracking_info else None,
+                )
                 if not tracking_info:
                     return
             else:
@@ -5350,20 +5631,33 @@ class BotHandlers:
                     chat_id=message_chat_id,
                     sent_from_account="НИК-2",
                 )
+                correlation_reason = "reply_tracking" if tracking_info else "reply_tracking_not_found"
+                self._editor_trace(
+                    "correlation_result",
+                    method="reply_tracking",
+                    reason=correlation_reason,
+                    tracking_key=tracking_key,
+                    incoming_file_name=incoming_name or None,
+                    reply_to_message_id=effective_reply_id,
+                    task=self._editor_tracking_summary(tracking_key, tracking_info) if tracking_info else None,
+                )
 
-            if not tracking_info and not effective_reply_id and getattr(message, "document", None):
-                file_name = getattr(message.document, "file_name", "") or ""
-                if file_name.lower().endswith(".pdf"):
-                    sender = (
-                        message.from_user.username or str(message.from_user.id)
-                        if getattr(message, "from_user", None)
-                        else ""
-                    )
-                    matched_key, matched_info, _reason = self.find_editor_tracking_for_unreplied_pdf(
-                        sender,
-                        file_name,
+            if not tracking_info and not effective_reply_id and message_document:
+                if incoming_name.lower().endswith(".pdf"):
+                    matched_key, matched_info, reason = self.find_editor_tracking_for_unreplied_pdf(
+                        incoming_sender,
+                        incoming_name,
                         sent_from_account="НИК-2",
                         reply_chat_id=message_chat_id,
+                    )
+                    correlation_reason = reason
+                    self._editor_trace(
+                        "correlation_result",
+                        method="unreplied_filename",
+                        reason=reason,
+                        tracking_key=matched_key,
+                        incoming_file_name=incoming_name,
+                        task=self._editor_tracking_summary(matched_key, matched_info) if matched_info else None,
                     )
                     if matched_info:
                         tracking_key = matched_key
@@ -5371,23 +5665,57 @@ class BotHandlers:
                         effective_reply_id = matched_info.get("reply_to_message_id")
 
             if not tracking_info:
-                if client.name == "НИК-2":
+                self._editor_trace(
+                    "response_unmatched",
+                    reason=correlation_reason,
+                    message_id=getattr(message, "id", None),
+                    incoming_file_name=incoming_name or None,
+                    tracking_snapshot=self._editor_tracking_snapshot(),
+                )
+                if client_name == "НИК-2":
                     self._warn_unknown_editor_response(message, effective_reply_id)
                 return
 
+            self._editor_trace(
+                "response_matched",
+                reason=correlation_reason,
+                message_id=getattr(message, "id", None),
+                incoming_file_name=incoming_name or None,
+                effective_reply_to_message_id=effective_reply_id,
+                tracking_key=tracking_key,
+                task=self._editor_tracking_summary(tracking_key, tracking_info),
+            )
             print(f"\n📨 Ответ от редактора на сообщение {effective_reply_id}")
             print(f"📄 Тип файла: {'АНТИ' if tracking_info.get('is_anti_file') else 'Обычный'}")
-            print(f"👤 Получено в аккаунте: {client.name}")
-            self._log_editor(f"📨 Ответ от редактора на сообщение {effective_reply_id} | account={client.name} file={tracking_info.get('original_name')}")
+            print(f"👤 Получено в аккаунте: {client_name}")
+            self._log_editor(f"📨 Ответ от редактора на сообщение {effective_reply_id} | account={client_name} file={tracking_info.get('original_name')}")
 
             # Проверяем, что редактор отправил документ
             if not message.document:
+                self._editor_trace(
+                    "response_without_document",
+                    message_id=getattr(message, "id", None),
+                    text_present=bool(getattr(message, "text", None)),
+                    text_error_file_name=self._extract_editor_error_file_name(getattr(message, "text", None)),
+                    task=self._editor_tracking_summary(tracking_key, tracking_info),
+                )
                 response_claim_key, claimed = self._claim_editor_response(message)
                 if not claimed:
+                    self._editor_trace(
+                        "response_ignored",
+                        reason="duplicate_response_claim",
+                        message_id=getattr(message, "id", None),
+                    )
                     return
                 if message.text and self._is_no_checks_message(message.text):
                     destination = tracking_info.get("destination")
                     self._mark_editor_unavailable(destination)
+                    self._editor_trace(
+                        "editor_unavailable",
+                        destination=destination,
+                        message_id=getattr(message, "id", None),
+                        task=self._editor_tracking_summary(tracking_key, tracking_info),
+                    )
                     print(f"⛔ Редактор {destination or 'неизвестен'} сообщил, что проверки закончились")
                     self._log_editor(
                         f"⛔ Редактор {destination or 'unknown'} сообщил, что проверки закончились | "
@@ -5402,6 +5730,13 @@ class BotHandlers:
                     if not self._editor_tracking_matches_file(error_file_name, tracking_info):
                         if effective_reply_id:
                             self._release_editor_response_claim(response_claim_key)
+                            self._editor_trace(
+                                "response_rejected",
+                                reason="editor_error_reply_mismatch",
+                                error_file_name=error_file_name,
+                                effective_reply_to_message_id=effective_reply_id,
+                                task=self._editor_tracking_summary(tracking_key, tracking_info),
+                            )
                             print(f"⚠️ Ошибка редактора не привязана: {error_file_name}, reply mismatch")
                             self._log_editor(
                                 f"⚠️ Ошибка редактора не привязана: file={error_file_name} reply mismatch"
@@ -5416,6 +5751,12 @@ class BotHandlers:
                         )
                         if not matched_info:
                             self._release_editor_response_claim(response_claim_key)
+                            self._editor_trace(
+                                "response_rejected",
+                                reason=reason,
+                                error_file_name=error_file_name,
+                                tracking_snapshot=self._editor_tracking_snapshot(),
+                            )
                             print(f"⚠️  Ошибка редактора не привязана: {error_file_name}, {reason}")
                             self._log_editor(f"⚠️ Ошибка редактора не привязана: file={error_file_name} reason={reason}")
                             return
@@ -5442,21 +5783,56 @@ class BotHandlers:
                     response_accepted = True
                     return
                 self._release_editor_response_claim(response_claim_key)
+                self._editor_trace(
+                    "response_rejected",
+                    reason="editor_did_not_send_document",
+                    message_id=getattr(message, "id", None),
+                    task=self._editor_tracking_summary(tracking_key, tracking_info),
+                )
                 print("⚠️  Редактор не отправил документ")
                 return
 
-            file_name = message.document.file_name
+            file_name = incoming_name
 
             # Проверяем, что это PDF файл (редактор должен вернуть PDF)
             if not file_name.lower().endswith('.pdf'):
+                self._editor_trace(
+                    "response_rejected",
+                    reason="editor_returned_non_pdf",
+                    incoming_file_name=file_name,
+                    task=self._editor_tracking_summary(tracking_key, tracking_info),
+                )
                 print(f"⚠️  Редактор вернул не PDF файл: {file_name}")
                 return
 
+            self._editor_trace(
+                "pdf_received",
+                incoming_file_name=file_name,
+                message_id=getattr(message, "id", None),
+                effective_reply_to_message_id=effective_reply_id,
+                task=self._editor_tracking_summary(tracking_key, tracking_info),
+            )
             print(f"✅ Редактор вернул PDF: {file_name}")
             self._log_editor(f"✅ Редактор вернул PDF: {file_name}")
 
             if not self._editor_tracking_matches_file(file_name, tracking_info):
+                self._editor_trace(
+                    "response_name_check_failed",
+                    incoming_file_name=file_name,
+                    effective_reply_to_message_id=effective_reply_id,
+                    expected_pdf_name=tracking_info.get("expected_pdf_name"),
+                    expected_ai_pdf_name=tracking_info.get("expected_ai_pdf_name"),
+                    original_file_name=tracking_info.get("original_file_name") or tracking_info.get("original_name"),
+                    has_job_marker=self._has_editor_job_marker(file_name),
+                    task=self._editor_tracking_summary(tracking_key, tracking_info),
+                )
                 if effective_reply_id:
+                    self._editor_trace(
+                        "response_rejected",
+                        reason="reply_name_mismatch",
+                        incoming_file_name=file_name,
+                        effective_reply_to_message_id=effective_reply_id,
+                    )
                     print(
                         f"⚠️  PDF от редактора не отправлен: имя {file_name} "
                         "не соответствует задаче из reply"
@@ -5477,7 +5853,21 @@ class BotHandlers:
                     tracking_key = matched_key
                     tracking_info = matched_info
                     effective_reply_id = matched_info.get("reply_to_message_id")
+                    self._editor_trace(
+                        "response_rematched",
+                        reason=reason,
+                        incoming_file_name=file_name,
+                        tracking_key=tracking_key,
+                        effective_reply_to_message_id=effective_reply_id,
+                        task=self._editor_tracking_summary(tracking_key, tracking_info),
+                    )
                 else:
+                    self._editor_trace(
+                        "response_rejected",
+                        reason=reason,
+                        incoming_file_name=file_name,
+                        tracking_snapshot=self._editor_tracking_snapshot(),
+                    )
                     print(f"⚠️  PDF от редактора не отправлен: имя {file_name} не совпало с ожидающим файлом ({reason})")
                     self._log_editor(
                         f"⚠️ PDF от редактора не отправлен: file={file_name} "
@@ -5491,22 +5881,51 @@ class BotHandlers:
                 delivered_reports = tracking_info.setdefault("delivered_reports", set())
                 report_key = self._editor_report_key(deliver_file_name)
                 if report_key in delivered_reports:
+                    self._editor_trace(
+                        "response_ignored",
+                        reason="duplicate_report",
+                        incoming_file_name=file_name,
+                        delivery_file_name=deliver_file_name,
+                        task=self._editor_tracking_summary(tracking_key, tracking_info),
+                    )
                     print(f"⏭️  PDF редактора уже доставлен: {file_name}")
                     self._log_editor(f"⏭️ PDF редактора уже доставлен повторно: {file_name}")
                     return
 
             response_claim_key, claimed = self._claim_editor_response(message)
             if not claimed:
+                self._editor_trace(
+                    "response_ignored",
+                    reason="duplicate_response_claim",
+                    incoming_file_name=file_name,
+                    delivery_file_name=deliver_file_name,
+                )
                 return
 
             delivery_accepted = False
+            self._editor_trace(
+                "delivery_start",
+                incoming_file_name=file_name,
+                delivery_file_name=deliver_file_name,
+                source_platform=tracking_info.get("source_platform"),
+                author=tracking_info.get("author"),
+                original_file_name=tracking_info.get("original_name") or tracking_info.get("original_file_name"),
+                tracking_key=tracking_key,
+                task=self._editor_tracking_summary(tracking_key, tracking_info),
+            )
 
             # Если это ответ в НИК-2, нужно отправить файл автору через НИК-1
-            if client.name == "НИК-2":
+            if client_name == "НИК-2":
                 # Получаем клиент НИК-1 для отправки обратно автору
                 client_nik1 = self.manager.get_client("НИК-1")
                 if not client_nik1:
                     self._release_editor_response_claim(response_claim_key)
+                    self._editor_trace(
+                        "delivery_rejected",
+                        reason="origin_client_missing",
+                        delivery_file_name=deliver_file_name,
+                        task=self._editor_tracking_summary(tracking_key, tracking_info),
+                    )
                     print("❌ Аккаунт НИК-1 не найден для отправки автору")
                     return
 
@@ -5519,6 +5938,12 @@ class BotHandlers:
 
                 if not os.path.exists(temp_path):
                     self._release_editor_response_claim(response_claim_key)
+                    self._editor_trace(
+                        "delivery_rejected",
+                        reason="downloaded_file_missing",
+                        delivery_file_name=deliver_file_name,
+                        downloaded_path=temp_path,
+                    )
                     print(f"❌ Файл не скачался: {temp_path}", flush=True)
                     return
                 sent_ok = False
@@ -5535,6 +5960,16 @@ class BotHandlers:
                         spooled
                         and str(tracking_info.get("source_platform") or "telegram").lower() != "telegram"
                     )
+                    self._editor_trace(
+                        "delivery_result",
+                        delivery_file_name=deliver_file_name,
+                        transport_status=delivery.get("status") if isinstance(delivery, dict) else None,
+                        transport_reason=delivery.get("reason") if isinstance(delivery, dict) else None,
+                        sent_ok=sent_ok,
+                        delivery_accepted=delivery_accepted,
+                        origin_account=getattr(client_nik1, "name", None),
+                        task=self._editor_tracking_summary(tracking_key, tracking_info),
+                    )
                     if sent_ok:
                         print("✅ PDF от редактора доставлен в исходный канал", flush=True)
                         self._log_editor("✅ PDF от редактора доставлен в исходный канал")
@@ -5543,6 +5978,12 @@ class BotHandlers:
                         print(f"⚠️ PDF от редактора сохранен в outbox для повторной доставки: {reason}", flush=True)
                         self._log_editor(f"⚠️ PDF от редактора сохранен в outbox для повторной доставки: {reason}")
                 except Exception as e:
+                    self._editor_trace(
+                        "delivery_error",
+                        delivery_file_name=deliver_file_name,
+                        error=str(e),
+                        task=self._editor_tracking_summary(tracking_key, tracking_info),
+                    )
                     print(f"❌ Сбой доставки PDF от редактора: {e}", flush=True)
                     self._log_editor(f"❌ Сбой доставки PDF от редактора: {e}")
                     import traceback
@@ -5569,6 +6010,12 @@ class BotHandlers:
                 # Fix #3: проверка успешного скачивания
                 if not os.path.exists(temp_path):
                     self._release_editor_response_claim(response_claim_key)
+                    self._editor_trace(
+                        "delivery_rejected",
+                        reason="downloaded_file_missing",
+                        delivery_file_name=deliver_file_name,
+                        downloaded_path=temp_path,
+                    )
                     print(f"❌ Файл не скачался: {temp_path}", flush=True)
                     return
 
@@ -5587,6 +6034,16 @@ class BotHandlers:
                         spooled
                         and str(tracking_info.get("source_platform") or "telegram").lower() != "telegram"
                     )
+                    self._editor_trace(
+                        "delivery_result",
+                        delivery_file_name=deliver_file_name,
+                        transport_status=delivery.get("status") if isinstance(delivery, dict) else None,
+                        transport_reason=delivery.get("reason") if isinstance(delivery, dict) else None,
+                        sent_ok=sent_ok,
+                        delivery_accepted=delivery_accepted,
+                        origin_account=getattr(client, "name", None),
+                        task=self._editor_tracking_summary(tracking_key, tracking_info),
+                    )
                     if sent_ok:
                         print(f"✅ PDF от редактора доставлен: {tracking_info['author']}")
                         self._log_editor(f"✅ PDF от редактора доставлен: {tracking_info['author']}")
@@ -5595,6 +6052,12 @@ class BotHandlers:
                         print(f"⚠️ PDF от редактора сохранен в outbox для повторной доставки: {reason}", flush=True)
                         self._log_editor(f"⚠️ PDF от редактора сохранен в outbox для повторной доставки: {reason}")
                 except Exception as e:
+                    self._editor_trace(
+                        "delivery_error",
+                        delivery_file_name=deliver_file_name,
+                        error=str(e),
+                        task=self._editor_tracking_summary(tracking_key, tracking_info),
+                    )
                     print(f"❌ Сбой доставки PDF от редактора (НИК-1): {e}", flush=True)
                     self._log_editor(f"❌ Сбой доставки PDF от редактора (НИК-1): {e}")
                     import traceback
@@ -5613,6 +6076,16 @@ class BotHandlers:
             if not delivery_accepted:
                 self._release_editor_response_claim(response_claim_key)
 
+            self._editor_trace(
+                "response_completed",
+                incoming_file_name=file_name,
+                delivery_file_name=deliver_file_name,
+                delivery_accepted=delivery_accepted,
+                response_claimed=bool(response_claim_key),
+                remaining_tracking_count=len(self.editor_tracking),
+                task=self._editor_tracking_summary(tracking_key, tracking_info),
+            )
+
             if multi_report and delivery_accepted:
                 tracking_info.setdefault("delivered_reports", set()).add(self._editor_report_key(deliver_file_name))
                 if tracking_info.get("editor_job_id"):
@@ -5625,7 +6098,7 @@ class BotHandlers:
                         self.editor_tracking.pop(tracking_key, None)
 
             # Удаляем из отслеживания
-            if delivery_accepted and not multi_report and client.name == "НИК-2":
+            if delivery_accepted and not multi_report and client_name == "НИК-2":
                 # Удаляем по специальному ключу
                 if tracking_key in self.editor_tracking:
                     del self.editor_tracking[tracking_key]
@@ -6614,9 +7087,10 @@ class BotHandlers:
             self._attach_editor_assignment(self.editor_tracking[tracking_key], processing_info)
             await self._mark_gateway_job_waiting_editor(processing_info, "waiting_editor_response_after_aaa_error")
 
-            print(f"✅ Файл отправлен редактору через НИК-2. Ожидаю: {original_name_without_ext}.pdf")
-            self._log_aaa(f"✅ Файл отправлен редактору через НИК-2. Ожидаю: {original_name_without_ext}.pdf")
-            self._log_editor(f"✅ Файл отправлен редактору через НИК-2. Ожидаю: {original_name_without_ext}.pdf")
+            expected_pdf_name = self.editor_tracking[tracking_key]["expected_pdf_name"]
+            print(f"✅ Файл отправлен редактору через НИК-2. Ожидаю: {expected_pdf_name}")
+            self._log_aaa(f"✅ Файл отправлен редактору через НИК-2. Ожидаю: {expected_pdf_name}")
+            self._log_editor(f"✅ Файл отправлен редактору через НИК-2. Ожидаю: {expected_pdf_name}")
 
             # Освобождаем аккаунт
             self.manager.mark_account_free(client.name, "")

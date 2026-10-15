@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -92,6 +93,27 @@ class EditorJobTokenTests(unittest.IsolatedAsyncioTestCase):
                     duplicate.download.assert_not_awaited()
                     self.assertEqual(before + 1, nik1.send_document.await_count)
                 self.assertEqual({}, handlers.editor_tracking)
+
+    async def test_date_separator_variants_deliver_to_forced_author(self):
+        original = "Статья_Надежность_АСТД_15.10.2026"
+        incoming = "Статья_Надежность_АСТД_15_10_2026"
+        handlers, nik1, nik2 = await self.assignments((11424,), names=[original + ".docx"])
+
+        wrong = self.response(11424, name="Статья_Надежность_АСТД_15_11_2026_job11424.pdf")
+        await handlers.handle_editor_response(nik2, wrong)
+        wrong.download.assert_not_awaited()
+        nik1.send_document.assert_not_awaited()
+
+        message = self.response(11424, name=f"{incoming}_job11424.pdf")
+        await handlers.handle_editor_response(nik2, message)
+
+        nik1.send_document.assert_awaited_once()
+        self.assertEqual(11424, nik1.send_document.await_args.kwargs["chat_id"])
+        self.assertEqual(original + ".pdf", nik1.send_document.await_args.kwargs["file_name"])
+        message.download.assert_awaited_once()
+        info = next(iter(handlers.editor_tracking.values()))
+        self.assertTrue(info["normal_report_delivered"])
+        self.assertFalse(info["ai_report_delivered"])
 
     async def test_parentheses_matching_preserves_assignment_validation(self):
         handlers, nik1, nik2 = await self.assignments((10885,), names=["Диплом (1).docx"])
@@ -251,6 +273,9 @@ class EditorJobTokenTests(unittest.IsolatedAsyncioTestCase):
 
     def test_legacy_and_shared_keys_do_not_gain_separator_matching(self):
         handlers = fixtures.BotHandlers.__new__(fixtures.BotHandlers)
+        handlers._editor_safety_store = SimpleNamespace(
+            editor_report_conflicts=lambda *_args: False,
+        )
         handlers.editor_tracking = {
             "first": {"destination": "@editor", "sent_from_account": "НИК-2", "original_name": "Диплом Иванов.docx"},
             "second": {"destination": "@editor", "sent_from_account": "НИК-2", "original_name": "Диплом_Иванов.docx"},
@@ -453,6 +478,43 @@ class EditorJobTokenTests(unittest.IsolatedAsyncioTestCase):
         nik1.send_document.assert_not_awaited()
         await handlers.handle_editor_response(nik2, self.response(name="ДИПЛОМ (копия).pdf", reply=1101))
         nik1.send_document.assert_awaited_once()
+
+    async def test_editor_send_trace_records_requested_and_actual_telegram_names(self):
+        handlers = fixtures.make_handlers()
+        sent = SimpleNamespace(
+            id=1101,
+            chat=SimpleNamespace(id=900),
+            document=SimpleNamespace(file_name="ДИПЛОМ (копия)__job105.docx", mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", file_size=42),
+        )
+        client = SimpleNamespace(name="НИК-2", send_document=AsyncMock(return_value=sent))
+        source = {"original_file_name": "ДИПЛОМ (копия).docx", "gateway_job_id": 105}
+        with patch.object(handlers, "_editor_trace") as trace:
+            await handlers._send_human_editor_document(client, "editor", "unused", source)
+        events = {
+            item.args[0]: item.kwargs
+            for item in trace.call_args_list
+        }
+        self.assertEqual("ДИПЛОМ (копия)__job105.docx", events["send_start"]["requested_file_name"])
+        self.assertEqual("ДИПЛОМ (копия)__job105.docx", events["send_result"]["requested_file_name"])
+        self.assertEqual("ДИПЛОМ (копия)__job105.docx", events["send_result"]["telegram_file_name"])
+
+    async def test_editor_send_uses_job_named_upload_copy_and_preserves_original(self):
+        handlers = fixtures.make_handlers()
+        sent = SimpleNamespace(
+            id=1101,
+            chat=SimpleNamespace(id=900),
+            document=SimpleNamespace(file_name="ДИПЛОМ.pdf__job105.pdf"),
+        )
+        client = SimpleNamespace(name="НИК-2", send_document=AsyncMock(return_value=sent))
+        source = {"original_file_name": "ДИПЛОМ.pdf", "gateway_job_id": 105}
+        with tempfile.TemporaryDirectory() as directory:
+            original_path = Path(directory) / "source.pdf"
+            original_path.write_bytes(b"pdf")
+            await handlers._send_human_editor_document(client, "editor", str(original_path), source)
+            upload_path = Path(client.send_document.await_args.kwargs["document"])
+            self.assertEqual("ДИПЛОМ__job105.pdf", upload_path.name)
+            self.assertFalse(upload_path.exists())
+            self.assertTrue(original_path.exists())
 
     async def test_original_user_job_word_restored_from_metadata(self):
         handlers = fixtures.make_handlers()
