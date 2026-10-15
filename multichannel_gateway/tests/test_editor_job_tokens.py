@@ -58,7 +58,7 @@ class EditorJobTokenTests(unittest.IsolatedAsyncioTestCase):
         handlers, nik1, nik2 = await fixtures.TestEditorReportsForFixedRoute._make_handlers_with_tasks(self, tasks, sent, config)
         nik2.name = "НИК-2"
         handlers._mark_gateway_job_done = AsyncMock()
-        handlers._get_editor_safety_store = lambda: (_ for _ in ()).throw(AssertionError("token path accessed basename history"))
+        handlers._get_editor_safety_store = lambda: SimpleNamespace(editor_report_conflicts=lambda *_args: False)
         return handlers, nik1, nik2
 
     def response(self, job=101, ai=False, reply=None, sender="editor", chat=900, incoming_id=None, name=None):
@@ -472,11 +472,9 @@ class EditorJobTokenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(info["normal_report_delivered"])
         handlers._mark_gateway_job_done.assert_awaited_once()
 
-    async def test_legacy_plain_explicit_reply_allowed_but_plain_no_reply_not_guessed(self):
+    async def test_jobless_plain_report_is_accepted_without_reply(self):
         handlers, nik1, nik2 = await self.assignments((101,))
         await handlers.handle_editor_response(nik2, self.response(name="ДИПЛОМ (копия).pdf"))
-        nik1.send_document.assert_not_awaited()
-        await handlers.handle_editor_response(nik2, self.response(name="ДИПЛОМ (копия).pdf", reply=1101))
         nik1.send_document.assert_awaited_once()
 
     async def test_editor_send_trace_records_requested_and_actual_telegram_names(self):
@@ -498,12 +496,12 @@ class EditorJobTokenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("ДИПЛОМ (копия)__job105.docx", events["send_result"]["requested_file_name"])
         self.assertEqual("ДИПЛОМ (копия)__job105.docx", events["send_result"]["telegram_file_name"])
 
-    async def test_editor_send_uses_job_named_upload_copy_and_preserves_original(self):
+    async def test_editor_send_preserves_transport_and_actual_telegram_names(self):
         handlers = fixtures.make_handlers()
         sent = SimpleNamespace(
             id=1101,
             chat=SimpleNamespace(id=900),
-            document=SimpleNamespace(file_name="ДИПЛОМ.pdf__job105.pdf"),
+            document=SimpleNamespace(file_name="ДИПЛОМ.pdf"),
         )
         client = SimpleNamespace(name="НИК-2", send_document=AsyncMock(return_value=sent))
         source = {"original_file_name": "ДИПЛОМ.pdf", "gateway_job_id": 105}
@@ -511,10 +509,154 @@ class EditorJobTokenTests(unittest.IsolatedAsyncioTestCase):
             original_path = Path(directory) / "source.pdf"
             original_path.write_bytes(b"pdf")
             await handlers._send_human_editor_document(client, "editor", str(original_path), source)
-            upload_path = Path(client.send_document.await_args.kwargs["document"])
-            self.assertEqual("ДИПЛОМ__job105.pdf", upload_path.name)
-            self.assertFalse(upload_path.exists())
+            self.assertEqual(str(original_path), client.send_document.await_args.kwargs["document"])
+            self.assertEqual("ДИПЛОМ__job105.pdf", client.send_document.await_args.kwargs["file_name"])
+            self.assertEqual("ДИПЛОМ__job105.pdf", source["transport_file_name"])
+            self.assertEqual("ДИПЛОМ.pdf", source["telegram_sent_file_name"])
             self.assertTrue(original_path.exists())
+
+    async def test_attach_editor_assignment_keeps_transport_and_actual_telegram_names(self):
+        handlers = fixtures.make_handlers()
+        source = {
+            "file_uid": "telegram:source",
+            "editor_job_id": 100,
+            "transport_file_name": "file__job100.pdf",
+            "telegram_sent_file_name": "file.pdf",
+            "original_file_name": "file.docx",
+        }
+        tracking = {}
+        handlers._attach_editor_assignment(tracking, source)
+        self.assertEqual("file__job100.pdf", tracking["transport_file_name"])
+        self.assertEqual("file.pdf", tracking["telegram_sent_file_name"])
+
+    async def test_single_jobless_normal_report_without_reply_delivers_to_origin(self):
+        handlers, nik1, nik2 = await self.assignments((11500,), names=["file.docx"])
+        info = next(iter(handlers.editor_tracking.values()))
+        info["telegram_sent_file_name"] = "file.pdf"
+
+        await handlers.handle_editor_response(nik2, self.response(11500, name="file.pdf"))
+
+        nik1.send_document.assert_awaited_once()
+        self.assertEqual("file.pdf", nik1.send_document.await_args.kwargs["file_name"])
+        self.assertTrue(info["normal_report_delivered"])
+        self.assertEqual("waiting_second_report", info["lifecycle"])
+
+    async def test_jobless_ai_separator_variants_use_same_assignment(self):
+        for incoming in ("ИИ file.pdf", "ИИ_file.pdf"):
+            with self.subTest(incoming=incoming):
+                handlers, nik1, nik2 = await self.assignments((11501,), names=["file.docx"])
+                next(iter(handlers.editor_tracking.values()))["telegram_sent_file_name"] = "file.pdf"
+
+                await handlers.handle_editor_response(nik2, self.response(11501, ai=True, name=incoming))
+
+                nik1.send_document.assert_awaited_once()
+                self.assertEqual("ИИ file.pdf", nik1.send_document.await_args.kwargs["file_name"])
+
+    async def test_jobless_normal_and_ai_reports_can_arrive_in_reverse_order(self):
+        handlers, nik1, nik2 = await self.assignments((11502,), names=["file.docx"])
+        info = next(iter(handlers.editor_tracking.values()))
+        info["telegram_sent_file_name"] = "file.pdf"
+
+        await handlers.handle_editor_response(nik2, self.response(11502, ai=True, name="ИИ_file.pdf"))
+        await handlers.handle_editor_response(nik2, self.response(11502, name="file.pdf"))
+
+        self.assertEqual(["ИИ file.pdf", "file.pdf"], [call.kwargs["file_name"] for call in nik1.send_document.await_args_list])
+        self.assertEqual("closed", info["lifecycle"])
+        self.assertEqual({}, handlers.editor_tracking)
+
+    async def test_two_pending_jobless_same_names_are_rejected_as_ambiguous(self):
+        handlers, nik1, nik2 = await self.assignments((11503, 11504), names=["file.docx", "file.docx"])
+        for info in handlers.editor_tracking.values():
+            info["telegram_sent_file_name"] = "file.pdf"
+
+        key, info, reason = handlers.find_editor_tracking_for_unreplied_pdf("editor", "file.pdf", reply_chat_id=900)
+
+        self.assertIsNone(key)
+        self.assertIsNone(info)
+        self.assertIn("неоднозначное", reason)
+        await handlers.handle_editor_response(nik2, self.response(11503, name="file.pdf"))
+        nik1.send_document.assert_not_awaited()
+
+    async def test_jobless_same_name_isolated_by_editor_destination(self):
+        handlers, nik1, nik2 = await self.assignments((11505, 11506), names=["file.docx", "file.docx"])
+        first, second = list(handlers.editor_tracking.values())
+        first["telegram_sent_file_name"] = "file.pdf"
+        second["telegram_sent_file_name"] = "file.pdf"
+        second["destination"] = "@other-editor"
+
+        key, info, reason = handlers.find_editor_tracking_for_unreplied_pdf("editor", "file.pdf", reply_chat_id=900)
+
+        self.assertIs(first, info, reason)
+        self.assertEqual("fixed_editor_900_12505", key)
+
+    async def test_recently_completed_same_name_blocks_new_jobless_assignment(self):
+        handlers = fixtures.make_handlers()
+        handlers._get_editor_safety_store = lambda: SimpleNamespace(editor_report_conflicts=lambda *_args: False)
+        handlers.editor_tracking = {
+            "old": {
+                "editor_job_id": 11507,
+                "gateway_job_id": 11507,
+                "original_file_name": "file.docx",
+                "original_basename": "file",
+                "telegram_sent_file_name": "file.pdf",
+                "expected_pdf_name": "file__job11507.pdf",
+                "expected_ai_pdf_name": "ИИ file__job11507.pdf",
+                "destination": "@editor",
+                "sent_from_account": "НИК-2",
+                "chat_id": 900,
+                "sent_at": datetime.now(),
+                "normal_report_delivered": True,
+                "ai_report_delivered": False,
+                "delivered_reports": {"file.pdf"},
+            },
+            "new": {
+                "editor_job_id": 11508,
+                "gateway_job_id": 11508,
+                "original_file_name": "file.docx",
+                "original_basename": "file",
+                "telegram_sent_file_name": "file.pdf",
+                "expected_pdf_name": "file__job11508.pdf",
+                "expected_ai_pdf_name": "ИИ file__job11508.pdf",
+                "destination": "@editor",
+                "sent_from_account": "НИК-2",
+                "chat_id": 900,
+                "sent_at": datetime.now(),
+                "normal_report_delivered": False,
+                "ai_report_delivered": False,
+                "delivered_reports": set(),
+            },
+        }
+
+        key, info, reason = handlers.find_editor_tracking_for_unreplied_pdf("editor", "file.pdf", reply_chat_id=900)
+
+        self.assertIsNone(key)
+        self.assertIsNone(info)
+        self.assertIn("недавно завершенная", reason)
+
+    async def test_jobless_real_filename_variants_return_original_client_name(self):
+        cases = (
+            ("Статья Обрат.Сторона Прозрачн..docx", "Статья_Обрат_Сторона_Прозрачн.pdf"),
+            ("Статья_Надежность_АСТД_15.10.2026.docx", "Статья_Надежность_АСТД_15_10_2026.pdf"),
+            ("Топологическое_письмо_субъекта_ПРЕДВАРИТЕЛЬНАЯ_тестовая_финальная.pdf", "Топологическое_письмо_субъекта_ПРЕДВАРИТЕЛЬНАЯ_тестовая_финальная.pdf"),
+        )
+        for index, (original, incoming) in enumerate(cases, 11509):
+            with self.subTest(original=original):
+                handlers, nik1, nik2 = await self.assignments((index,), names=[original])
+                next(iter(handlers.editor_tracking.values()))["telegram_sent_file_name"] = incoming
+                await handlers.handle_editor_response(nik2, self.response(index, name=incoming))
+                nik1.send_document.assert_awaited_once()
+                self.assertEqual(f"{Path(original).stem}.pdf", nik1.send_document.await_args.kwargs["file_name"])
+
+    async def test_duplicate_jobless_report_delivers_once(self):
+        handlers, nik1, nik2 = await self.assignments((11512,), names=["file.docx"])
+        next(iter(handlers.editor_tracking.values()))["telegram_sent_file_name"] = "file.pdf"
+        first = self.response(11512, name="file.pdf", incoming_id=70001)
+        duplicate = self.response(11512, name="file.pdf", incoming_id=70001)
+
+        await handlers.handle_editor_response(nik2, first)
+        await handlers.handle_editor_response(nik2, duplicate)
+
+        nik1.send_document.assert_awaited_once()
 
     async def test_original_user_job_word_restored_from_metadata(self):
         handlers = fixtures.make_handlers()

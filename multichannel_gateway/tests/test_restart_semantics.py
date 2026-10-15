@@ -146,17 +146,17 @@ class RestartSemanticsTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(count, client.send_document.await_count)
                 self.assertEqual({}, bot.handlers.editor_tracking)
 
-    async def test_plain_report_can_have_no_candidates_while_job_is_waiting(self):
+    async def test_plain_report_without_job_or_reply_matches_single_pending_assignment(self):
         bot = self.bot()
         original = "Топологическое_письмо_субъекта_ПРЕДВАРИТЕЛЬНАЯ_тестовая_финальная.pdf"
         await bot.handlers.handle_main_account(bot.manager.clients["НИК-1"], self.source(name=original))
         info = next(iter(bot.handlers.editor_tracking.values()))
         self.assertEqual("awaiting_editor", self.store.get_job(info["gateway_job_id"]).status)
         result = bot.handlers.find_editor_tracking_for_unreplied_pdf("editor", original, reply_chat_id=900)
-        self.assertEqual((None, None, "нет ожидающих задач"), result)
+        self.assertIs(info, result[1], result[2])
         self.assertEqual(1, len(bot.handlers.editor_tracking))
         await bot.handlers.handle_editor_response(
-            bot.manager.clients["НИК-2"], self.report(reply=info["reply_to_message_id"], name=original),
+            bot.manager.clients["НИК-2"], self.report(name=original),
         )
         bot.manager.clients["НИК-1"].send_document.assert_awaited_once()
 
@@ -168,6 +168,12 @@ class RestartSemanticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("abandoned", self.store.get_job(old_info["gateway_job_id"]).status)
         await bot.handlers.handle_editor_response(bot.manager.clients["НИК-2"], self.report())
         await bot.handlers.handle_main_account(bot.manager.clients["НИК-1"], self.source(2))
+        key, info, reason = bot.handlers.find_editor_tracking_for_unreplied_pdf(
+            "editor", "ДИПЛОМ.pdf", reply_chat_id=900,
+        )
+        self.assertIsNone(key)
+        self.assertIsNone(info)
+        self.assertIn("старого результата", reason)
         for name in ("ДИПЛОМ.pdf", "ИИ ДИПЛОМ.pdf"):
             await bot.handlers.handle_editor_response(bot.manager.clients["НИК-2"], self.report(name=name))
             await bot.handlers.handle_editor_response(bot.manager.clients["НИК-2"], self.report(old_info["reply_to_message_id"], name))

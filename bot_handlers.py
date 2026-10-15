@@ -2696,6 +2696,7 @@ class BotHandlers:
             "gateway_job_id": info.get("gateway_job_id"),
             "original_file_name": info.get("original_file_name") or info.get("original_name"),
             "transport_file_name": info.get("transport_file_name"),
+            "telegram_sent_file_name": info.get("telegram_sent_file_name"),
             "expected_pdf_name": info.get("expected_pdf_name"),
             "expected_ai_pdf_name": info.get("expected_ai_pdf_name"),
             "destination": info.get("destination"),
@@ -2892,8 +2893,48 @@ class BotHandlers:
         name = os.path.basename(str(file_name or ""))
         match = re.search(r"job[0-9]+\.[^.]+$", name)
         if not match:
-            return re.sub(r"[\s_()]+", "", cls._editor_report_key(name))
+            return re.sub(r"[\s_.()]+", "", cls._editor_report_key(name))
         return re.sub(r"[\s_.()]+", "", cls._editor_report_key(name[:match.start()])) + "__" + match.group().lower()
+
+    @staticmethod
+    def _editor_jobless_name_key(file_name: str) -> str:
+        stem = os.path.splitext(os.path.basename(str(file_name or "")))[0]
+        stem = unicodedata.normalize("NFC", stem)
+        return re.sub(r"[\s_.()]+", "", stem).casefold()
+
+    @classmethod
+    def _editor_jobless_aliases(cls, tracking_info: dict) -> set[str]:
+        aliases = set()
+        for name in cls._editor_jobless_report_names(tracking_info):
+            aliases.add(cls._editor_jobless_name_key(name))
+        return aliases
+
+    @classmethod
+    def _editor_jobless_report_names(cls, tracking_info: dict) -> set[str]:
+        names = set()
+        primary = tracking_info.get("telegram_sent_file_name")
+        if primary:
+            names.add(primary)
+        names.update(
+            name
+            for name in (
+                tracking_info.get("original_file_name"),
+                tracking_info.get("original_name"),
+                tracking_info.get("original_basename"),
+            )
+            if name
+        )
+        reports = set()
+        for name in names:
+            stem = os.path.splitext(os.path.basename(str(name)))[0]
+            if not stem:
+                continue
+            reports.update((f"{stem}.pdf", f"ИИ {stem}.pdf"))
+        return reports
+
+    @classmethod
+    def _editor_report_kind(cls, file_name: str) -> str:
+        return "ai" if cls._editor_jobless_name_key(file_name).startswith("ии") else "normal"
 
     @classmethod
     def _editor_tracking_keys(cls, tracking_info: dict) -> set[str]:
@@ -2910,10 +2951,9 @@ class BotHandlers:
     @classmethod
     def _editor_tracking_matches_file(cls, doc_name: str, tracking_info: dict) -> bool:
         if tracking_info.get("editor_job_id"):
+            if cls._editor_job_token(doc_name) is None:
+                return cls._editor_jobless_name_key(doc_name) in cls._editor_jobless_aliases(tracking_info)
             names = {tracking_info["expected_pdf_name"], tracking_info["expected_ai_pdf_name"]}
-            if not cls._has_editor_job_marker(doc_name):
-                stem = tracking_info["original_basename"]
-                names = {stem + ".pdf", "ИИ " + stem + ".pdf"}
             return cls._editor_assignment_report_key(os.path.splitext(doc_name)[0] + ".pdf") in {
                 cls._editor_assignment_report_key(os.path.splitext(name)[0] + ".pdf") for name in names
             }
@@ -2988,13 +3028,21 @@ class BotHandlers:
         print(f"⚠️  Не найдена информация об отправке для сообщения {reply_to_message_id} в НИК-2")
 
     def _editor_report_is_pending(self, file_name: str, tracking_info: dict) -> bool:
-        if not tracking_info.get("fixed_author_editor_route"):
+        if not (tracking_info.get("fixed_author_editor_route") or tracking_info.get("editor_job_id")):
             return True
-        delivered_reports = tracking_info.get("delivered_reports") or set()
-        return self._editor_report_key(file_name) not in delivered_reports
+        report_kind = self._editor_report_kind(file_name)
+        delivered_flag = tracking_info.get(f"{report_kind}_report_delivered")
+        if delivered_flag is True:
+            return False
+        delivered_reports = {
+            self._editor_jobless_name_key(name)
+            for name in (tracking_info.get("delivered_reports") or set())
+            if name
+        }
+        return self._editor_jobless_name_key(file_name) not in delivered_reports
 
     def _editor_tracking_is_recently_completed(self, tracking_info: dict, report_name=None, now=None) -> bool:
-        if not tracking_info.get("fixed_author_editor_route"):
+        if not (tracking_info.get("fixed_author_editor_route") or tracking_info.get("editor_job_id")):
             return False
         sent_at = tracking_info.get("sent_at")
         if not isinstance(sent_at, datetime):
@@ -3020,7 +3068,16 @@ class BotHandlers:
             if name
         }
         if report_name:
-            return self._editor_report_key(report_name) in delivered_reports
+            return self._editor_jobless_name_key(report_name) in {
+                self._editor_jobless_name_key(name)
+                for name in (tracking_info.get("delivered_reports") or set())
+                if name
+            }
+        if tracking_info.get("editor_job_id"):
+            return bool(
+                tracking_info.get("normal_report_delivered")
+                and tracking_info.get("ai_report_delivered")
+            )
         return bool(expected_reports) and expected_reports.issubset(delivered_reports)
 
     def _find_editor_tracking_by_reply(self, reply_to_message_id, chat_id=None, sent_from_account="НИК-2"):
@@ -3110,64 +3167,50 @@ class BotHandlers:
             info["editor_job_id"] = int(job_id) if isinstance(job_id, (int, str)) and str(job_id).isdigit() and int(job_id) > 0 else uuid.uuid4().int
         stem, extension = os.path.splitext(os.path.basename(original))
         info["transport_file_name"] = f"{stem}__job{info['editor_job_id']}{extension}"
-        upload_path = path
-        upload_dir = None
-        try:
-            if os.path.isfile(path) and os.path.basename(path) != info["transport_file_name"]:
-                upload_dir = tempfile.mkdtemp(prefix="editor-upload-")
-                upload_path = os.path.join(upload_dir, info["transport_file_name"])
-                shutil.copy2(path, upload_path)
-            self._editor_trace(
-                "send_start",
-                account=getattr(client, "name", None),
-                destination=destination,
-                job_id=info.get("editor_job_id"),
-                gateway_job_id=info.get("gateway_job_id"),
-                original_file_name=original,
-                requested_file_name=info["transport_file_name"],
-                local_file_name=os.path.basename(path),
-                upload_file_name=os.path.basename(upload_path),
-                renamed_upload=upload_path != path,
-            )
-            sent_message = await client.send_document(
-                chat_id=destination,
-                document=upload_path,
-                file_name=info["transport_file_name"],
-            )
-            sent_document = getattr(sent_message, "document", None)
-            self._editor_trace(
-                "send_result",
-                account=getattr(client, "name", None),
-                destination=destination,
-                job_id=info.get("editor_job_id"),
-                gateway_job_id=info.get("gateway_job_id"),
-                message_id=getattr(sent_message, "id", None),
-                chat_id=getattr(getattr(sent_message, "chat", None), "id", None),
-                requested_file_name=info["transport_file_name"],
-                telegram_file_name=getattr(sent_document, "file_name", None),
-                telegram_mime_type=getattr(sent_document, "mime_type", None),
-                telegram_file_size=getattr(sent_document, "file_size", None),
-                local_file_name=os.path.basename(path),
-                upload_file_name=os.path.basename(upload_path),
-                renamed_upload=upload_path != path,
-            )
-            return sent_message
-        finally:
-            if upload_dir:
-                try:
-                    os.unlink(upload_path)
-                except FileNotFoundError:
-                    pass
-                try:
-                    os.rmdir(upload_dir)
-                except OSError:
-                    pass
+        self._editor_trace(
+            "send_start",
+            account=getattr(client, "name", None),
+            destination=destination,
+            job_id=info.get("editor_job_id"),
+            gateway_job_id=info.get("gateway_job_id"),
+            original_file_name=original,
+            requested_file_name=info["transport_file_name"],
+            local_file_name=os.path.basename(path),
+            upload_file_name=os.path.basename(path),
+            renamed_upload=False,
+        )
+        sent_message = await client.send_document(
+            chat_id=destination,
+            document=path,
+            file_name=info["transport_file_name"],
+        )
+        sent_document = getattr(sent_message, "document", None)
+        telegram_sent_file_name = getattr(sent_document, "file_name", None) or info["transport_file_name"]
+        info["telegram_sent_file_name"] = telegram_sent_file_name
+        self._editor_trace(
+            "send_result",
+            account=getattr(client, "name", None),
+            destination=destination,
+            job_id=info.get("editor_job_id"),
+            gateway_job_id=info.get("gateway_job_id"),
+            message_id=getattr(sent_message, "id", None),
+            chat_id=getattr(getattr(sent_message, "chat", None), "id", None),
+            requested_file_name=info["transport_file_name"],
+            telegram_file_name=telegram_sent_file_name,
+            telegram_mime_type=getattr(sent_document, "mime_type", None),
+            telegram_file_size=getattr(sent_document, "file_size", None),
+            local_file_name=os.path.basename(path),
+            upload_file_name=os.path.basename(path),
+            renamed_upload=False,
+        )
+        return sent_message
 
     def _attach_editor_assignment(self, tracking, source):
         tracking.update(
             file_uid=source.get("file_uid"),
             editor_job_id=source["editor_job_id"],
             transport_file_name=source["transport_file_name"],
+            telegram_sent_file_name=source.get("telegram_sent_file_name") or source["transport_file_name"],
             original_file_name=source["original_file_name"],
             original_basename=os.path.splitext(os.path.basename(source["original_file_name"]))[0],
             expected_pdf_name=os.path.splitext(source["transport_file_name"])[0] + ".pdf",
@@ -3181,6 +3224,7 @@ class BotHandlers:
             gateway_job_id=tracking.get("gateway_job_id"),
             original_file_name=tracking.get("original_file_name"),
             transport_file_name=tracking.get("transport_file_name"),
+            telegram_sent_file_name=tracking.get("telegram_sent_file_name"),
             expected_pdf_name=tracking.get("expected_pdf_name"),
             expected_ai_pdf_name=tracking.get("expected_ai_pdf_name"),
             destination=tracking.get("destination"),
@@ -3295,6 +3339,21 @@ class BotHandlers:
             self._editor_safety_store = build_store()
         return self._editor_safety_store
 
+    def _editor_restart_safety_reason(self, tracking_info: dict):
+        if not tracking_info.get("editor_job_id"):
+            return None
+        task_key = str(tracking_info.get("editor_job_id"))
+        try:
+            store = self._get_editor_safety_store()
+            for report_name in self._editor_jobless_report_names(tracking_info):
+                report_key = self._editor_report_key(report_name)
+                if store.editor_report_conflicts("*", "*", report_key, task_key):
+                    return "есть защита от старого результата после перезапуска"
+        except Exception as exc:
+            self._log_editor(f"Editor restart safety history unavailable: {exc}")
+            return "недоступна защита от старого результата после перезапуска"
+        return None
+
     def find_editor_tracking_for_unreplied_pdf(
         self,
         sender: str,
@@ -3303,11 +3362,13 @@ class BotHandlers:
         reply_chat_id=None,
     ):
         self._expire_editor_assignments()
+        job_id = self._editor_job_token(doc_name)
         has_job_marker = self._has_editor_job_marker(doc_name)
         self._editor_trace(
             "unreplied_match_start",
             incoming_file_name=doc_name,
             has_job_marker=has_job_marker,
+            parsed_job_id=job_id,
             sender=sender,
             sent_from_account=sent_from_account,
             reply_chat_id=reply_chat_id,
@@ -3316,17 +3377,22 @@ class BotHandlers:
         if has_job_marker:
             return self._find_token_editor_assignment(sender, doc_name, sent_from_account, reply_chat_id)
         sender_clean = str(sender or "").replace("@", "").lower()
-        candidates = [
+        scoped_candidates = [
             (key, info)
             for key, info in self.editor_tracking.items()
-            if not info.get("editor_job_id") and info.get("sent_from_account") == sent_from_account
+            if info.get("sent_from_account") == sent_from_account
             and str(info.get("destination", "")).replace("@", "").lower() == sender_clean
             and (
                 reply_chat_id is None
                 or info.get("chat_id") is None
                 or str(info.get("chat_id")) == str(reply_chat_id)
             )
-            and self._editor_report_is_pending(doc_name, info)
+        ]
+        candidates = [
+            (key, info)
+            for key, info in scoped_candidates
+            if self._editor_report_is_pending(doc_name, info)
+            and self._editor_tracking_matches_file(doc_name, info)
         ]
         self._editor_trace(
             "unreplied_match_candidates",
@@ -3335,21 +3401,26 @@ class BotHandlers:
             candidates=[self._editor_tracking_summary(key, info) for key, info in candidates],
         )
         if not candidates:
+            reason = "нет ожидающих задач" if not scoped_candidates else f"нет точного совпадения имени файла: {doc_name}"
             self._editor_trace(
                 "unreplied_match_rejected",
-                reason="нет ожидающих задач",
+                reason=reason,
                 incoming_file_name=doc_name,
                 tracking_snapshot=self._editor_tracking_snapshot(),
             )
-            return None, None, "нет ожидающих задач"
-        matches = [
-            (key, info)
-            for key, info in candidates
-            if self._editor_tracking_matches_file(doc_name, info)
-        ]
-        if len(matches) == 1:
-            matched_key, matched_info = matches[0]
+            return None, None, reason
+        if len(candidates) == 1:
+            matched_key, matched_info = candidates[0]
             sender_clean = str(sender or "").replace("@", "").lower()
+            restart_safety_reason = self._editor_restart_safety_reason(matched_info)
+            if restart_safety_reason:
+                self._editor_trace(
+                    "unreplied_match_rejected",
+                    reason=restart_safety_reason,
+                    incoming_file_name=doc_name,
+                    task=self._editor_tracking_summary(matched_key, matched_info),
+                )
+                return None, None, restart_safety_reason
             completed_conflicts = [
                 info
                 for key, info in self.editor_tracking.items()
@@ -3382,20 +3453,20 @@ class BotHandlers:
                 task=self._editor_tracking_summary(matched_key, matched_info),
             )
             return matched_key, matched_info, "точное совпадение имени файла"
-        if len(matches) > 1:
+        if len(candidates) > 1:
             self._editor_trace(
                 "unreplied_match_rejected",
                 reason="неоднозначное имя файла",
                 incoming_file_name=doc_name,
-                match_count=len(matches),
-                matching_tasks=[self._editor_tracking_summary(key, info) for key, info in matches],
+                match_count=len(candidates),
+                matching_tasks=[self._editor_tracking_summary(key, info) for key, info in candidates],
             )
             return None, None, f"неоднозначное имя файла: {doc_name}"
         self._editor_trace(
             "unreplied_match_rejected",
             reason="нет точного совпадения имени файла",
             incoming_file_name=doc_name,
-            candidate_tasks=[self._editor_tracking_summary(key, info) for key, info in candidates],
+            candidate_tasks=[self._editor_tracking_summary(key, info) for key, info in scoped_candidates],
         )
         return None, None, f"нет точного совпадения имени файла: {doc_name}"
 
